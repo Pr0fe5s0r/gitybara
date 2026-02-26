@@ -137,6 +137,10 @@ Done.
 
 ## 📐 Architecture
 
+<div align="center">
+  <img src="assets/architecture.png" alt="Gitybara Architecture">
+</div>
+
 Gitybara acts as the **Orchestrator** between:
 
 * GitHub
