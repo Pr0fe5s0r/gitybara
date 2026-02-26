@@ -21,7 +21,7 @@ export function startServer(port: number) {
         res.json({
             status: "running",
             pid: process.pid,
-            repos: config?.repos.map((r) => `${r.owner}/${r.repo}`) ?? [],
+            repos: config?.repos.map((r) => `${r.owner}/${r.repo}`) || [],
             jobs,
         });
     });
@@ -33,7 +33,7 @@ export function startServer(port: number) {
 
     // ── GET /jobs ────────────────────────────────────────────────────────
     app.get("/jobs", async (req, res) => {
-        const limit = parseInt(String(req.query.limit ?? "50"), 10);
+        const limit = parseInt(String(req.query.limit || "50"), 10);
         const status = req.query.status as string | undefined;
         let query = "SELECT * FROM jobs";
         const params: any[] = [];

@@ -58,7 +58,7 @@ export async function learnCommand(
     });
     const repoId = rs2.rows[0].id as number;
 
-    const cmd = subcommand ?? "list";
+    const cmd = subcommand || "list";
 
     if (cmd === "add") {
         if (options.do) {

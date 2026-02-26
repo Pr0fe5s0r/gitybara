@@ -3,7 +3,7 @@ import { pino } from "pino";
 export function createLogger(name: string) {
     return pino({
         name,
-        level: process.env.LOG_LEVEL ?? "info",
+        level: process.env.LOG_LEVEL || "info",
         transport:
             process.stdout.isTTY
                 ? {

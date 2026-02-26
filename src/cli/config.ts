@@ -6,7 +6,7 @@ export async function configCommand(options: {
     get?: string;
     list?: boolean;
 }) {
-    const config = readConfig() ?? getDefaultConfig();
+    const config = readConfig() || getDefaultConfig();
 
     if (options.list || (!options.set && !options.get)) {
         console.log(chalk.bold.cyan("\n🦫 Gitybara Configuration\n"));
@@ -15,8 +15,8 @@ export async function configCommand(options: {
             ["opencodePath", config.opencodePath],
             ["pollingIntervalMinutes", config.pollingIntervalMinutes],
             ["daemonPort", config.daemonPort],
-            ["defaultProvider", config.defaultProvider ?? chalk.gray("(opencode default)")],
-            ["defaultModel", config.defaultModel ?? chalk.gray("(opencode default)")],
+            ["defaultProvider", config.defaultProvider || chalk.gray("(opencode default)")],
+            ["defaultModel", config.defaultModel || chalk.gray("(opencode default)")],
             ["repos", config.repos.map((r) => `${r.owner}/${r.repo}`).join(", ") || chalk.gray("(none)")],
         ];
         for (const [k, v] of entries) {

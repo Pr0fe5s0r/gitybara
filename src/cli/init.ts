@@ -21,7 +21,7 @@ export async function initCommand(options: { repo?: string }) {
         chalk.gray(" — Autonomous GitHub Issue Solver\n")
     );
 
-    const existingConfig = readConfig() ?? getDefaultConfig();
+    const existingConfig = readConfig() || getDefaultConfig();
 
     // ── Step 1: GitHub Token ────────────────────────────────────────────
     console.log(chalk.bold("Step 1: GitHub Authentication"));
@@ -87,7 +87,7 @@ export async function initCommand(options: { repo?: string }) {
 
         // Clone path
         const defaultClonePath = path.join(
-            process.env.HOME ?? process.env.USERPROFILE ?? "~",
+            process.env.HOME || process.env.USERPROFILE || "~",
             ".gitybara",
             "repos",
             `${owner}-${repo}`
@@ -219,13 +219,13 @@ export async function initCommand(options: { repo?: string }) {
             type: "number",
             name: "pollingInterval",
             message: "Polling interval (minutes):",
-            default: existingConfig.pollingIntervalMinutes ?? 5,
+            default: existingConfig.pollingIntervalMinutes || 5,
         },
         {
             type: "number",
             name: "daemonPort",
             message: "Local HTTP server port (for status API & webhooks):",
-            default: existingConfig.daemonPort ?? 4242,
+            default: existingConfig.daemonPort || 4242,
         },
     ]);
 

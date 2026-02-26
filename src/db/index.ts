@@ -103,7 +103,7 @@ export async function updateJob(
     await getDb().execute({
         sql: `UPDATE jobs SET status = ?, branch = ?, pr_url = ?, error = ?, updated_at = datetime('now')
        WHERE id = ?`,
-        args: [status, branch ?? null, prUrl ?? null, error ?? null, id]
+        args: [status, branch || null, prUrl || null, error || null, id]
     });
 }
 

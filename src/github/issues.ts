@@ -34,10 +34,10 @@ export async function listOpenIssues(
         .map((i) => ({
             number: i.number,
             title: i.title,
-            body: i.body ?? null,
+            body: i.body || null,
             html_url: i.html_url,
             labels: i.labels.map((l) =>
-                typeof l === "string" ? l : (l.name ?? "")
+                typeof l === "string" ? l : (l.name || "")
             ),
         }))
         .filter((i) => !i.labels.includes("gitybara:done"));
@@ -98,7 +98,7 @@ export async function getIssueComments(
         per_page: 100, // Fetch up to 100 comments
     });
 
-    return data.map((comment) => comment.body ?? "");
+    return data.map((comment) => comment.body || "");
 }
 
 export async function ensureModelLabels(

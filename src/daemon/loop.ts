@@ -295,7 +295,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             const rules = await getRules(repoId);
             const systemPrompt = buildSystemPrompt(
                 owner, repo, issue.number, issue.title,
-                issue.body ?? "", rules, comments
+                issue.body || "", rules, comments
             );
 
             // 5. Run OpenCode

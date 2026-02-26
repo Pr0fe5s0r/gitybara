@@ -1,6 +1,6 @@
 {
   "name": "gitybara",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "An AI coding assistant that actually ships code automatically from GitHub issues.",
   "files": [
     "dist",
