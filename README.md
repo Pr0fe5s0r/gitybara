@@ -88,6 +88,9 @@ cd gitybara
 npm install
 npm run build
 npm link
+
+# Install Chrome for WhatsApp bridge
+npx puppeteer browsers install chrome
 ````
 
 ### Prerequisites
@@ -95,6 +98,7 @@ npm link
 * OpenCode installed and available in PATH
 * GitHub Personal Access Token (`repo`, `workflow`)
 * Git 2.30+ (worktree support)
+* **Chrome/Chromium** (Required for WhatsApp integration. Install via `npx puppeteer browsers install chrome`)
 
 ---
 

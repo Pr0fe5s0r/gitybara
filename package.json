@@ -1,7 +1,7 @@
 {
   "name": "gitybara",
   "version": "0.1.0",
-  "description": "Autonomous GitHub issue solver powered by OpenCode",
+  "description": "",
   "type": "module",
   "bin": {
     "gitybara": "./dist/cli/index.js"

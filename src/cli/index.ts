@@ -14,7 +14,7 @@ program
     .name("gitybara")
     .description(
         chalk.bold.cyan("🦫 Gitybara") +
-        " — Autonomous GitHub issue solver powered by OpenCode"
+        " — An AI coding assistant that actually does software development."
     )
     .version("0.1.0");
 
