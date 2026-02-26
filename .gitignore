@@ -149,3 +149,8 @@ sessions/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Junk
+sdklog*.txt
+testSdkLog.ts
+bun.lock

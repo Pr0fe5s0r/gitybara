@@ -1,7 +1,11 @@
 {
   "name": "gitybara",
   "version": "0.1.0",
-  "description": "",
+  "description": "An AI coding assistant that actually ships code automatically from GitHub issues.",
+  "files": [
+    "dist",
+    "assets"
+  ],
   "type": "module",
   "bin": {
     "gitybara": "./dist/cli/index.js"
@@ -10,7 +14,8 @@
     "dev": "tsx src/cli/index.ts",
     "build": "tsc",
     "start": "node dist/cli/index.js",
-    "lint": "eslint src --ext .ts"
+    "lint": "eslint src --ext .ts",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@libsql/client": "^0.6.0",
