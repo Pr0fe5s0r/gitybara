@@ -169,6 +169,21 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 log.warn({ err }, "Failed to update shared repo cache, continuing anyway");
             }
         }
+
+        // Ensure REPO_MEMORY.md exists for AI agent clarifications
+        try {
+            await ensureRepoMemory(
+                repoId,
+                clonePath,
+                owner,
+                repo,
+                config.opencodePath,
+                config.defaultProvider,
+                config.defaultModel
+            );
+        } catch (memoryErr) {
+            log.warn({ err: memoryErr, owner, repo }, "Failed to ensure REPO_MEMORY.md, continuing anyway");
+        }
     }
 
     const limit = pLimit(3); // Process up to 3 issues concurrently per repo
