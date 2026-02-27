@@ -18,7 +18,8 @@ import {
     upsertRepo,
     createJob,
     updateJob,
-    getJobByIssue
+    getJobByIssue,
+    resetStaleJobs
 } from "../db/index.js";
 import { createLogger } from "../utils/logger.js";
 
@@ -31,6 +32,12 @@ export async function runDaemon(config: GlobalConfig, port: number) {
     // Start HTTP server in background
     const { startServer } = await import("./server.js");
     startServer(port);
+
+    // Reset jobs that were in-progress if daemon was killed
+    const resetCount = await resetStaleJobs();
+    if (resetCount > 0) {
+        log.info({ count: resetCount }, "🔄 Recovered incomplete jobs on startup");
+    }
 
     // Start WhatsApp Listener in background (won't block if not configured)
     const { startWhatsappDaemon } = await import("../whatsapp/client.js");
@@ -177,9 +184,22 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
         const comments = await getIssueComments(octokit, owner, repo, issue.number);
 
         if (existingJob) {
-            if (existingJob.status === "done" || existingJob.status === "in-progress") {
-                log.debug({ issue: issue.number }, "Already processed or in-progress, skipping");
+            if (existingJob.status === "done") {
+                log.debug({ issue: issue.number }, "Already processed, skipping");
                 return;
+            }
+            if (existingJob.status === "in-progress") {
+                // Liveness check: Is it fresh?
+                const updatedAt = new Date(existingJob.updated_at).getTime();
+                const now = Date.now();
+                // If it's been in-progress for more than 45 minutes, it's probably dead or stuck
+                const isStale = (now - updatedAt) > 45 * 60 * 1000;
+
+                if (!isStale) {
+                    log.debug({ issue: issue.number }, "Already in-progress and fresh, skipping");
+                    return;
+                }
+                log.info({ issue: issue.number }, "⚠️ Job is stale in-progress. Resuming work...");
             }
             if (existingJob.status === "waiting") {
                 // If the last comment starts with Gitybara, the user hasn't replied yet

@@ -123,8 +123,8 @@ export async function isIssueProcessed(
 
 export async function resetStaleJobs(): Promise<number> {
     const rs = await getDb().execute({
-        sql: `UPDATE jobs SET status = 'failed', error = 'Daemon forcefully restarted while processing'
-       WHERE status IN ('pending', 'in-progress')`,
+        sql: `UPDATE jobs SET status = 'pending', error = NULL
+       WHERE status IN ('in-progress')`,
         args: []
     });
     return Number(rs.rowsAffected);
