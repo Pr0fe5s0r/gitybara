@@ -1,5 +1,61 @@
 import { readConfig, writeConfig, getDefaultConfig } from "./config-store.js";
 import chalk from "chalk";
+import inquirer from "inquirer";
+import ora from "ora";
+import { getAvailableModels } from "../opencode/models.js";
+
+export async function configModelCommand() {
+    const config = readConfig() || getDefaultConfig();
+
+    const spinner = ora("Fetching available models from OpenCode...").start();
+    let models: { providerId: string, modelId: string }[];
+    
+    try {
+        models = await getAvailableModels();
+        spinner.succeed(chalk.green(`Found ${models.length} available models`));
+    } catch (err) {
+        spinner.fail(chalk.red("Could not fetch models from OpenCode. Is OpenCode running?"));
+        process.exit(1);
+    }
+
+    if (models.length === 0) {
+        console.log(chalk.yellow("No models available."));
+        return;
+    }
+
+    const modelChoices = models.map(m => ({
+        name: `${chalk.cyan(m.providerId)}/${m.modelId}`,
+        value: { providerId: m.providerId, modelId: m.modelId },
+    }));
+
+    const currentModel = config.defaultModel 
+        ? `${config.defaultProvider || "opencode"}/${config.defaultModel}`
+        : null;
+
+    const { selectedModel } = await inquirer.prompt([
+        {
+            type: "list",
+            name: "selectedModel",
+            message: `Select default AI model${currentModel ? ` (current: ${currentModel})` : ""}:`,
+            choices: [
+                ...(currentModel ? [{ name: "Keep current selection", value: null }] : []),
+                ...modelChoices,
+            ],
+            default: currentModel ? 1 : 0,
+        },
+    ]);
+
+    if (selectedModel === null) {
+        console.log(chalk.yellow("Keeping current selection."));
+        return;
+    }
+
+    config.defaultProvider = selectedModel.providerId;
+    config.defaultModel = selectedModel.modelId;
+    writeConfig(config);
+
+    console.log(chalk.bold.green(`\n✅ Default model set to ${selectedModel.providerId}/${selectedModel.modelId}`));
+}
 
 export async function configCommand(options: {
     set?: string;
