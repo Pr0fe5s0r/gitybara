@@ -1,4 +1,5 @@
 import { Octokit } from "@octokit/rest";
+import { withRetry } from "../utils/retry.js";
 
 export async function createBranch(
     octokit: Octokit,
@@ -8,21 +9,21 @@ export async function createBranch(
     newBranch: string
 ): Promise<void> {
     // Get SHA of base branch
-    const { data: ref } = await octokit.rest.git.getRef({
+    const { data: ref } = await withRetry(() => octokit.rest.git.getRef({
         owner,
         repo,
         ref: `heads/${baseBranch}`,
-    });
+    }));
     const sha = ref.object.sha;
 
     // Create new branch
     try {
-        await octokit.rest.git.createRef({
+        await withRetry(() => octokit.rest.git.createRef({
             owner,
             repo,
             ref: `refs/heads/${newBranch}`,
             sha,
-        });
+        }));
     } catch (err: any) {
         if (err.status === 422 && err.message.includes("Reference already exists")) {
             // Ignore if branch already exists

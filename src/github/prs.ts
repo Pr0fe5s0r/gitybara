@@ -1,4 +1,5 @@
 import { Octokit } from "@octokit/rest";
+import { withRetry } from "../utils/retry.js";
 
 export interface PRResult {
     url: string;
@@ -14,14 +15,14 @@ export async function openPR(
     title: string,
     body: string
 ): Promise<PRResult> {
-    const { data } = await octokit.rest.pulls.create({
+    const { data } = await withRetry(() => octokit.rest.pulls.create({
         owner,
         repo,
         title,
         body,
         head,
         base,
-    });
+    }));
     return { url: data.html_url, number: data.number };
 }
 
@@ -30,11 +31,11 @@ export async function listOpenPRs(
     owner: string,
     repo: string
 ) {
-    const { data } = await octokit.rest.pulls.list({
+    const { data } = await withRetry(() => octokit.rest.pulls.list({
         owner,
         repo,
         state: "open",
-    });
+    }));
     return data;
 }
 
@@ -44,10 +45,10 @@ export async function getPR(
     repo: string,
     pullNumber: number
 ) {
-    const { data } = await octokit.rest.pulls.get({
+    const { data } = await withRetry(() => octokit.rest.pulls.get({
         owner,
         repo,
         pull_number: pullNumber,
-    });
+    }));
     return data;
 }

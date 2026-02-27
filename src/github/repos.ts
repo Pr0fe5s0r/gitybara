@@ -1,4 +1,5 @@
 import { Octokit } from "@octokit/rest";
+import { withRetry } from "../utils/retry.js";
 
 export async function fetchUserRepos(octokit: Octokit): Promise<string[]> {
     const repos: string[] = [];
@@ -6,11 +7,11 @@ export async function fetchUserRepos(octokit: Octokit): Promise<string[]> {
     const perPage = 100;
 
     while (true) {
-        const response = await octokit.rest.repos.listForAuthenticatedUser({
+        const response = await withRetry(() => octokit.rest.repos.listForAuthenticatedUser({
             per_page: perPage,
             page: page,
             sort: "updated",
-        });
+        }));
 
         if (response.data.length === 0) break;
 
