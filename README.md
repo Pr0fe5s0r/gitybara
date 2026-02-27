@@ -80,17 +80,22 @@ It executes.
 
 ---
 
-## 🛠 Installation
+### 🛠 Installation & Setup
 
+```bash
+bun install gitybara -g
+
+# Install Chrome for WhatsApp bridge
+npx puppeteer browsers install chrome
+```
+
+Alternatively (Dev):
 ```bash
 git clone https://github.com/your-username/gitybara.git
 cd gitybara
 npm install
 npm run build
 npm link
-
-# Install Chrome for WhatsApp bridge
-npx puppeteer browsers install chrome
 ````
 
 ### Prerequisites

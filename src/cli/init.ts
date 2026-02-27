@@ -127,16 +127,53 @@ export async function initCommand(options: { repo?: string }) {
     ]);
 
     // Check opencode accessible
+    let opencodeFound = false;
     const spinner2 = ora("Checking OpenCode…").start();
     try {
         await execa(opencodePath, ["--version"]);
         spinner2.succeed(chalk.green("OpenCode found!"));
+        opencodeFound = true;
     } catch {
-        spinner2.warn(
-            chalk.yellow(
-                "OpenCode not found at that path. You can fix this later via `gitybara config --set opencodePath=<path>`."
-            )
-        );
+        spinner2.warn(chalk.yellow("OpenCode not found."));
+
+        const { installOpenCode } = await inquirer.prompt([
+            {
+                type: "confirm",
+                name: "installOpenCode",
+                message: "OpenCode SDK is missing. Would you like to install it now?",
+                default: true,
+            }
+        ]);
+
+        if (installOpenCode) {
+            const installSpinner = ora("Installing OpenCode SDK…").start();
+            try {
+                // Try bun first, then npm
+                let useBun = false;
+                try {
+                    await execa("bun", ["--version"]);
+                    useBun = true;
+                } catch { }
+
+                if (useBun) {
+                    await execa("bun", ["install", "-g", "opencode-ai"]);
+                } else {
+                    await execa("npm", ["install", "-g", "opencode-ai"]);
+                }
+
+                installSpinner.succeed(chalk.green("OpenCode SDK installed successfully!"));
+
+                // Re-verify
+                try {
+                    await execa("opencode", ["--version"]);
+                    opencodeFound = true;
+                } catch {
+                    console.log(chalk.yellow("Note: You might need to restart your terminal for the 'opencode' command to be available."));
+                }
+            } catch (err: any) {
+                installSpinner.fail(chalk.red(`Failed to install OpenCode SDK: ${err.message}`));
+            }
+        }
     }
 
     let defaultProvider = "";
@@ -231,23 +268,49 @@ export async function initCommand(options: { repo?: string }) {
 
     // ── Step 5: WhatsApp Integration ────────────────────────────────────
     console.log(chalk.bold("\nStep 5: WhatsApp Integration (Optional)"));
-    const { connectWhatsapp } = await inquirer.prompt([
-        {
-            type: "confirm",
-            name: "connectWhatsapp",
-            message: "Connect WhatsApp to create GitHub issues via text message?",
-            default: false,
-        }
-    ]);
 
     let whatsappOwnerId = existingConfig.whatsappOwnerId;
-    if (connectWhatsapp) {
-        try {
-            const { onboardWhatsapp } = await import("../whatsapp/client.js");
-            whatsappOwnerId = await onboardWhatsapp();
-            console.log(chalk.green(`\nWhatsApp connected! Bound to: ${whatsappOwnerId}`));
-        } catch (err: any) {
-            console.log(chalk.red(`\nWhatsApp connection failed: ${err.message}`));
+
+    if (whatsappOwnerId) {
+        const { reconnectWhatsapp } = await inquirer.prompt([
+            {
+                type: "confirm",
+                name: "reconnectWhatsapp",
+                message: `WhatsApp is already connected (Owner ID: ${whatsappOwnerId}). Do you want to remove the connection and reconnect?`,
+                default: false,
+            }
+        ]);
+
+        if (reconnectWhatsapp) {
+            whatsappOwnerId = undefined;
+            try {
+                const { onboardWhatsapp } = await import("../whatsapp/client.js");
+                whatsappOwnerId = await onboardWhatsapp({ forceNew: true });
+                console.log(chalk.green(`\nWhatsApp connected! Bound to: ${whatsappOwnerId}`));
+            } catch (err: any) {
+                console.log(chalk.red(`\nWhatsApp connection failed: ${err.message}`));
+            }
+        } else {
+            console.log(chalk.gray(`\nKeeping existing WhatsApp connection.`));
+        }
+    } else {
+        const { connectWhatsapp } = await inquirer.prompt([
+            {
+                type: "confirm",
+                name: "connectWhatsapp",
+                message: "Connect WhatsApp to create GitHub issues via text message?",
+                default: false,
+            }
+        ]);
+
+        if (connectWhatsapp) {
+            try {
+                const { onboardWhatsapp } = await import("../whatsapp/client.js");
+                whatsappOwnerId = await onboardWhatsapp();
+                console.log(chalk.green(`\nWhatsApp connected! Bound to: ${whatsappOwnerId}`));
+            } catch (err: any) {
+                console.log(chalk.red(`\nWhatsApp connection failed: ${err.message}`));
+            }
         }
     }
 

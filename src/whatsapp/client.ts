@@ -38,7 +38,10 @@ async function sendTagged(client: any, to: string, text: string) {
     return client.sendMessage(to, `[GITYBARA] ${text}`);
 }
 
-export async function onboardWhatsapp(): Promise<string> {
+export async function onboardWhatsapp(options?: { forceNew?: boolean }): Promise<string> {
+    if (options?.forceNew && fs.existsSync(SESSION_PATH)) {
+        fs.rmSync(SESSION_PATH, { recursive: true, force: true });
+    }
     ensureSessionPath();
 
     const client = new Client({
@@ -46,6 +49,10 @@ export async function onboardWhatsapp(): Promise<string> {
             clientId: "gitybara-client",
             dataPath: SESSION_PATH
         }),
+        webVersionCache: {
+            type: "local",
+            path: path.join(SESSION_PATH, ".wwebjs_cache")
+        },
         puppeteer: {
             headless: true,
             args: ["--no-sandbox", "--disable-setuid-sandbox"]
@@ -53,11 +60,17 @@ export async function onboardWhatsapp(): Promise<string> {
     });
 
     return new Promise((resolve, reject) => {
-        let otp = `GITYBARA-${Math.floor(1000 + Math.random() * 9000)}`;
+        let otp = `${Math.floor(100000 + Math.random() * 900000)}`;
         let spinner: any;
 
+        let qrCount = 0;
         client.on("qr", (qr) => {
-            console.log(chalk.bold.yellow("\n📱 Scan this QR code with WhatsApp to connect:"));
+            qrCount++;
+            if (qrCount > 1) {
+                console.log(chalk.bold.yellow("\n🔄 QR Code refreshed. Please scan the new QR code:"));
+            } else {
+                console.log(chalk.bold.yellow("\n📱 Scan this QR code with WhatsApp to connect:"));
+            }
             qrcode.generate(qr, { small: true });
         });
 
@@ -103,6 +116,10 @@ export async function startWhatsappDaemon(
             clientId: "gitybara-client",
             dataPath: SESSION_PATH
         }),
+        webVersionCache: {
+            type: "local",
+            path: path.join(SESSION_PATH, ".wwebjs_cache")
+        },
         puppeteer: {
             headless: true,
             args: ["--no-sandbox", "--disable-setuid-sandbox"]
