@@ -14,6 +14,7 @@ import { commentOnIssue, labelIssue, ensureModelLabels, getIssueComments } from 
 import { runOpenCode, encodeWorkspacePath } from "../opencode/runner.js";
 import { getAvailableModels } from "../opencode/models.js";
 import { getRules, buildSystemPrompt } from "../learning/engine.js";
+import { ensureRepoMemory, updateRepoMemoryWithInsights } from "../memory/manager.js";
 import {
     upsertRepo,
     createJob,

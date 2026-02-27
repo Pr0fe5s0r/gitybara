@@ -1,4 +1,5 @@
 import { getDb } from "../db/index.js";
+import { getMemoryForPrompt } from "../memory/manager.js";
 
 export interface Rule {
     id: number;
@@ -18,15 +19,20 @@ export async function getRules(repoId: number): Promise<Rule[]> {
     }));
 }
 
-export function buildSystemPrompt(
+export async function getRepoMemoryForPrompt(repoId: number): Promise<string | null> {
+    return getMemoryForPrompt(repoId);
+}
+
+export async function buildSystemPrompt(
     owner: string,
     repo: string,
     issueNumber: number,
     issueTitle: string,
     issueBody: string,
     rules: Rule[],
-    comments?: string[]
-): string {
+    comments?: string[],
+    repoId?: number
+): Promise<string> {
     const doRules = rules.filter((r) => r.type === "do");
     const dontRules = rules.filter((r) => r.type === "dont");
 
@@ -49,11 +55,27 @@ ${comments.map((c, i) => `Comment ${i + 1}:\n${c}`).join("\n\n")}
 `.trim();
     }
 
+    // Fetch repository memory if repoId is provided
+    let memorySection = "";
+    if (repoId) {
+        const memory = await getMemoryForPrompt(repoId);
+        if (memory) {
+            memorySection = `
+## Repository Memory (REPO_MEMORY.md)
+The following is the accumulated knowledge about this repository. Read it carefully to understand the codebase structure, patterns, and important decisions.
+
+${memory}
+`.trim();
+        }
+    }
+
     return `You are Gitybara, an autonomous coding agent working on the GitHub repository **${owner}/${repo}**.
 
 Your task is to resolve the following GitHub issue by writing code changes directly to the repository files in the current working directory.
 
 ${rulesSection}
+
+${memorySection}
 
 ## Issue #${issueNumber}: ${issueTitle}
 
