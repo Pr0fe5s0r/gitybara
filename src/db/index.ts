@@ -48,7 +48,22 @@ export async function initDb(): Promise<void> {
     );`,
         `CREATE INDEX IF NOT EXISTS idx_jobs_repo ON jobs(repo_id);`,
         `CREATE INDEX IF NOT EXISTS idx_jobs_issue ON jobs(issue_number);`,
-        `CREATE INDEX IF NOT EXISTS idx_rules_repo ON rules(repo_id);`
+        `CREATE INDEX IF NOT EXISTS idx_rules_repo ON rules(repo_id);`,
+        // Table for tracking processed PR/issue comments to avoid duplicate processing
+        `CREATE TABLE IF NOT EXISTS processed_comments (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_owner   TEXT NOT NULL,
+            repo_name    TEXT NOT NULL,
+            issue_number INTEGER NOT NULL,
+            comment_id   INTEGER NOT NULL,
+            comment_body TEXT,
+            comment_hash TEXT NOT NULL,
+            processed_at TEXT DEFAULT (datetime('now')),
+            status       TEXT DEFAULT 'processed',
+            UNIQUE(repo_owner, repo_name, comment_id)
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_processed_comments_repo ON processed_comments(repo_owner, repo_name);`,
+        `CREATE INDEX IF NOT EXISTS idx_processed_comments_issue ON processed_comments(issue_number);`
     ], "write");
 
     // Migration: Add force_new_branch to existing jobs table if missing
@@ -182,4 +197,89 @@ export async function getJobByIssue(
     });
     if (rs.rows.length === 0) return null;
     return rs.rows[0] as unknown as JobRecord;
+}
+
+export interface ProcessedComment {
+    id: number;
+    repo_owner: string;
+    repo_name: string;
+    issue_number: number;
+    comment_id: number;
+    comment_body: string | null;
+    comment_hash: string;
+    processed_at: string;
+    status: string;
+}
+
+/**
+ * Check if a comment has already been processed
+ */
+export async function isCommentProcessed(
+    repoOwner: string,
+    repoName: string,
+    commentId: number
+): Promise<boolean> {
+    const rs = await getDb().execute({
+        sql: `SELECT id FROM processed_comments 
+       WHERE repo_owner = ? AND repo_name = ? AND comment_id = ?`,
+        args: [repoOwner, repoName, commentId]
+    });
+    return rs.rows.length > 0;
+}
+
+/**
+ * Mark a comment as processed
+ */
+export async function markCommentProcessed(
+    repoOwner: string,
+    repoName: string,
+    issueNumber: number,
+    commentId: number,
+    commentBody: string,
+    status: string = 'processed'
+): Promise<void> {
+    // Create a hash of the comment body to detect edits
+    const crypto = await import('crypto');
+    const commentHash = crypto.createHash('sha256').update(commentBody).digest('hex');
+    
+    await getDb().execute({
+        sql: `INSERT OR REPLACE INTO processed_comments 
+       (repo_owner, repo_name, issue_number, comment_id, comment_body, comment_hash, status, processed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+        args: [repoOwner, repoName, issueNumber, commentId, commentBody, commentHash, status]
+    });
+}
+
+/**
+ * Get all processed comments for an issue/PR
+ */
+export async function getProcessedCommentsForIssue(
+    repoOwner: string,
+    repoName: string,
+    issueNumber: number
+): Promise<ProcessedComment[]> {
+    const rs = await getDb().execute({
+        sql: `SELECT * FROM processed_comments 
+       WHERE repo_owner = ? AND repo_name = ? AND issue_number = ?
+       ORDER BY processed_at DESC`,
+        args: [repoOwner, repoName, issueNumber]
+    });
+    return rs.rows as unknown as ProcessedComment[];
+}
+
+/**
+ * Get the last processed comment timestamp for an issue/PR
+ */
+export async function getLastProcessedCommentTime(
+    repoOwner: string,
+    repoName: string,
+    issueNumber: number
+): Promise<string | null> {
+    const rs = await getDb().execute({
+        sql: `SELECT MAX(processed_at) as last_time FROM processed_comments 
+       WHERE repo_owner = ? AND repo_name = ? AND issue_number = ?`,
+        args: [repoOwner, repoName, issueNumber]
+    });
+    if (rs.rows.length === 0 || !rs.rows[0].last_time) return null;
+    return rs.rows[0].last_time as string;
 }

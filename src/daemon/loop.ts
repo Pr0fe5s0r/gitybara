@@ -23,6 +23,7 @@ import {
 } from "../db/index.js";
 import { createLogger } from "../utils/logger.js";
 import { registerTask, unregisterTask, cancelTask } from "../tasks/manager.js";
+import { findActionableComments, buildFixPrompt, postFixResponse, CommentMonitorConfig } from "../monitor/comments.js";
 
 const log = createLogger("daemon-loop");
 
@@ -224,6 +225,46 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                         log.info({ issue: issue.number, branch: association.branchName, reason: association.reason }, "🤝 Smart Association: Joining existing branch");
                         finalBranchName = association.branchName;
                         isJoiningBranch = true;
+                        
+                        // Check for actionable comments on the associated PR
+                        try {
+                            // Find the PR number for this branch
+                            const prResponse = await octokit.rest.pulls.list({
+                                owner,
+                                repo,
+                                state: "open",
+                                head: `${owner}:${association.branchName}`
+                            });
+                            
+                            if (prResponse.data.length > 0) {
+                                const prNumber = prResponse.data[0].number;
+                                const commentConfig: CommentMonitorConfig = {
+                                    enabled: true,
+                                    autoApplyFixes: true,
+                                    skipBotComments: true,
+                                    actionableKeywords: [
+                                        'fix', 'change', 'update', 'modify', 'correct', 'improve',
+                                        'please fix', 'can you fix', 'need to fix', 'should fix',
+                                        'change request', 'requested changes', 'please address',
+                                        'update the', 'modify the', 'fix the', 'correct the'
+                                    ]
+                                };
+                                
+                                const actionableComments = await findActionableComments(
+                                    octokit, owner, repo, prNumber, true, commentConfig
+                                );
+                                
+                                if (actionableComments.length > 0) {
+                                    log.info({ issue: issue.number, pr: prNumber, comments: actionableComments.length }, 
+                                        `💬 Found ${actionableComments.length} actionable comments on associated PR #${prNumber}`);
+                                    // Store the actionable comments to process them after setup
+                                    (issue as any).actionableComments = actionableComments;
+                                    (issue as any).associatedPRNumber = prNumber;
+                                }
+                            }
+                        } catch (commentErr) {
+                            log.warn({ err: commentErr, issue: issue.number }, "Failed to check for actionable comments on associated PR");
+                        }
                     }
                 }
             } catch (assocErr) {
@@ -397,6 +438,47 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             const remoteWithToken = `https://x-access-token:${config.githubToken}@github.com/${owner}/${repo}.git`;
             await git.push(["-f", remoteWithToken, `HEAD:${finalBranchName}`]);
 
+            // Check if there are actionable comments to address (from PR review)
+            const actionableComments = (issue as any).actionableComments;
+            const associatedPRNumber = (issue as any).associatedPRNumber;
+            
+            if (actionableComments && actionableComments.length > 0 && associatedPRNumber) {
+                log.info({ issue: issue.number, comments: actionableComments.length }, 
+                    "Addressing actionable comments from PR review…");
+                
+                const fixPrompt = buildFixPrompt(
+                    issue.title,
+                    issue.body || '',
+                    actionableComments
+                );
+                
+                const fixResult = await runOpenCode(
+                    config.opencodePath,
+                    workDir,
+                    fixPrompt,
+                    selectedProvider,
+                    selectedModel
+                );
+                
+                if (fixResult.success && fixResult.filesChanged.length > 0) {
+                    // Commit the fixes
+                    await git.add(".");
+                    await git.commit(
+                        `fix(#${issue.number}): Addressed feedback from PR comments\n\n${fixResult.summary}`
+                    );
+                    await git.push(["-f", remoteWithToken, `HEAD:${finalBranchName}`]);
+                    
+                    await postFixResponse(
+                        octokit, owner, repo, associatedPRNumber, true,
+                        fixResult.filesChanged,
+                        fixResult.summary
+                    );
+                    
+                    log.info({ issue: issue.number, pr: associatedPRNumber }, 
+                        "✅ Successfully addressed PR review comments");
+                }
+            }
+
             // 7. Open PR
             const prBody = buildPRBody(issue.number, issue.title, result.summary, result.filesChanged);
             const pr = await openPR(
@@ -465,6 +547,9 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
 
     // Wait for all issues in this repo to finish processing before returning
     await Promise.all(issuePromises);
+
+    // Process actionable comments on issues with existing PRs
+    await processIssueComments(octokit, owner, repo, clonePath, config, limit);
 
     // Process PRs for conflicts
     const prPromises = candidatePRs.map(pr => limit(async () => {
@@ -548,9 +633,272 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
         } else {
             log.debug({ pr: pr.number }, "Pull Request is mergeable, no action needed.");
         }
+        
+        // Check for actionable comments on the PR
+        try {
+            const commentConfig: CommentMonitorConfig = {
+                enabled: true,
+                autoApplyFixes: true,
+                skipBotComments: true,
+                actionableKeywords: [
+                    'fix', 'change', 'update', 'modify', 'correct', 'improve',
+                    'please fix', 'can you fix', 'need to fix', 'should fix',
+                    'change request', 'requested changes', 'please address',
+                    'update the', 'modify the', 'fix the', 'correct the'
+                ]
+            };
+            
+            const actionableComments = await findActionableComments(
+                octokit, owner, repo, pr.number, true, commentConfig
+            );
+            
+            if (actionableComments.length > 0) {
+                log.info({ pr: pr.number, comments: actionableComments.length }, 
+                    `💬 Found ${actionableComments.length} actionable comments on PR, applying fixes…`);
+                
+                const branchName = fullPR.head.ref;
+                const safeBranchName = branchName.replace(/[^\w.-]/g, "-") + "-comment-fix";
+                const workDir = path.join(path.dirname(clonePath), safeBranchName);
+                const sharedGit = simpleGit(clonePath);
+                
+                try {
+                    // Ensure workdir is clean
+                    if (fs.existsSync(workDir)) {
+                        await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
+                        rimrafSync(workDir, { maxRetries: 3 });
+                    }
+                    
+                    // Prepare worktree
+                    await sharedGit.fetch(["origin", branchName]);
+                    await execa("git", ["worktree", "add", "-d", workDir, `origin/${branchName}`], { cwd: clonePath });
+                    
+                    const git: SimpleGit = simpleGit(workDir);
+                    
+                    // Build prompt from actionable comments
+                    const fixPrompt = buildFixPrompt(
+                        fullPR.title,
+                        fullPR.body || '',
+                        actionableComments
+                    );
+                    
+                    log.info({ pr: pr.number }, "Running OpenCode to address feedback…");
+                    
+                    const result = await runOpenCode(
+                        config.opencodePath,
+                        workDir,
+                        fixPrompt,
+                        config.defaultProvider,
+                        config.defaultModel
+                    );
+                    
+                    if (!result.success) {
+                        throw new Error(`OpenCode failed to apply fixes: ${result.summary}`);
+                    }
+                    
+                    if (result.filesChanged.length === 0) {
+                        log.info({ pr: pr.number }, "No file changes were made by OpenCode");
+                    } else {
+                        // Commit and push
+                        await git.add(".");
+                        const status = await git.status();
+                        if (status.staged.length > 0) {
+                            await git.commit(`🦫 Gitybara: Addressed feedback from PR comments`);
+                            const remoteWithToken = `https://x-access-token:${config.githubToken}@github.com/${owner}/${repo}.git`;
+                            await git.push(["-f", remoteWithToken, `HEAD:${branchName}`]);
+                            
+                            await postFixResponse(
+                                octokit, owner, repo, pr.number, true,
+                                result.filesChanged,
+                                result.summary
+                            );
+                            
+                            log.info({ pr: pr.number }, "✅ Successfully applied fixes from PR comments");
+                        }
+                    }
+                    
+                    // Cleanup
+                    await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
+                } catch (err) {
+                    log.error({ err, pr: pr.number }, "❌ Failed to apply fixes from comments");
+                    await commentOnIssue(
+                        octokit, owner, repo, pr.number, 
+                        `🦫 **Gitybara** failed to automatically apply fixes from the feedback:\n\`\`\`\n${err}\n\`\`\``
+                    ).catch(() => { });
+                    
+                    // Cleanup on error
+                    if (fs.existsSync(workDir)) {
+                        await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
+                    }
+                }
+            }
+        } catch (commentErr) {
+            log.error({ err: commentErr, pr: pr.number }, "Error processing PR comments");
+        }
     }));
 
     await Promise.all(prPromises);
+}
+
+/**
+ * Process actionable comments on issues that have associated PRs
+ */
+async function processIssueComments(
+    octokit: any,
+    owner: string,
+    repo: string,
+    clonePath: string,
+    config: GlobalConfig,
+    limit: any
+): Promise<void> {
+    // Get issues that have associated PRs (from jobs table)
+    const { getDb } = await import("../db/index.js");
+    const db = getDb();
+    
+    const rs = await db.execute({
+        sql: `SELECT issue_number FROM jobs 
+               WHERE repo_owner = ? AND repo_name = ? 
+               AND status = 'done' 
+               AND pr_url IS NOT NULL`,
+        args: [owner, repo]
+    });
+    
+    if (rs.rows.length === 0) {
+        return;
+    }
+    
+    const issuesWithPRs = rs.rows.map((r: any) => r.issue_number as number);
+    log.info({ issues: issuesWithPRs.length }, `Checking ${issuesWithPRs.length} issues with PRs for actionable comments`);
+    
+    for (const issueNumber of issuesWithPRs) {
+        try {
+            // Find the associated PR
+            const { data: prs } = await octokit.rest.pulls.list({
+                owner,
+                repo,
+                state: "open"
+            });
+            
+            // Find PR that mentions this issue
+            const associatedPR = prs.find((pr: any) => 
+                pr.body?.includes(`#${issueNumber}`) || 
+                pr.title?.includes(`#${issueNumber}`)
+            );
+            
+            if (!associatedPR) {
+                continue;
+            }
+            
+            // Check for actionable comments on the issue
+            const commentConfig: CommentMonitorConfig = {
+                enabled: true,
+                autoApplyFixes: true,
+                skipBotComments: true,
+                actionableKeywords: [
+                    'fix', 'change', 'update', 'modify', 'correct', 'improve',
+                    'please fix', 'can you fix', 'need to fix', 'should fix',
+                    'change request', 'requested changes', 'please address',
+                    'update the', 'modify the', 'fix the', 'correct the'
+                ]
+            };
+            
+            const actionableComments = await findActionableComments(
+                octokit, owner, repo, issueNumber, false, commentConfig
+            );
+            
+            if (actionableComments.length === 0) {
+                continue;
+            }
+            
+            log.info({ issue: issueNumber, pr: associatedPR.number, comments: actionableComments.length }, 
+                `💬 Found ${actionableComments.length} actionable comments on issue #${issueNumber}`);
+            
+            // Process the comments similar to PR comments
+            const branchName = associatedPR.head.ref;
+            const safeBranchName = branchName.replace(/[^\w.-]/g, "-") + "-issue-comment-fix";
+            const workDir = path.join(path.dirname(clonePath), safeBranchName);
+            const sharedGit = simpleGit(clonePath);
+            
+            try {
+                // Ensure workdir is clean
+                if (fs.existsSync(workDir)) {
+                    await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
+                    rimrafSync(workDir, { maxRetries: 3 });
+                }
+                
+                // Prepare worktree
+                await sharedGit.fetch(["origin", branchName]);
+                await execa("git", ["worktree", "add", "-d", workDir, `origin/${branchName}`], { cwd: clonePath });
+                
+                const git: SimpleGit = simpleGit(workDir);
+                
+                // Get issue details
+                const { data: issue } = await octokit.rest.issues.get({
+                    owner,
+                    repo,
+                    issue_number: issueNumber
+                });
+                
+                // Build prompt from actionable comments
+                const fixPrompt = buildFixPrompt(
+                    issue.title,
+                    issue.body || '',
+                    actionableComments
+                );
+                
+                log.info({ issue: issueNumber, pr: associatedPR.number }, "Running OpenCode to address issue feedback…");
+                
+                const result = await runOpenCode(
+                    config.opencodePath,
+                    workDir,
+                    fixPrompt,
+                    config.defaultProvider,
+                    config.defaultModel
+                );
+                
+                if (!result.success) {
+                    throw new Error(`OpenCode failed to apply fixes: ${result.summary}`);
+                }
+                
+                if (result.filesChanged.length === 0) {
+                    log.info({ issue: issueNumber }, "No file changes were made by OpenCode");
+                } else {
+                    // Commit and push
+                    await git.add(".");
+                    const status = await git.status();
+                    if (status.staged.length > 0) {
+                        await git.commit(`🦫 Gitybara: Addressed feedback from issue #${issueNumber} comments`);
+                        const remoteWithToken = `https://x-access-token:${config.githubToken}@github.com/${owner}/${repo}.git`;
+                        await git.push(["-f", remoteWithToken, `HEAD:${branchName}`]);
+                        
+                        await postFixResponse(
+                            octokit, owner, repo, associatedPR.number, true,
+                            result.filesChanged,
+                            result.summary
+                        );
+                        
+                        log.info({ issue: issueNumber, pr: associatedPR.number }, 
+                            "✅ Successfully applied fixes from issue comments");
+                    }
+                }
+                
+                // Cleanup
+                await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
+            } catch (err) {
+                log.error({ err, issue: issueNumber }, "❌ Failed to apply fixes from issue comments");
+                await commentOnIssue(
+                    octokit, owner, repo, issueNumber, 
+                    `🦫 **Gitybara** failed to automatically apply fixes from the feedback on this issue:\n\`\`\`\n${err}\n\`\`\``
+                ).catch(() => { });
+                
+                // Cleanup on error
+                if (fs.existsSync(workDir)) {
+                    await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
+                }
+            }
+        } catch (err) {
+            log.error({ err, issue: issueNumber }, "Error processing issue comments");
+        }
+    }
 }
 
 function buildPRBody(
