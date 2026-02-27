@@ -9,6 +9,10 @@ import { learnCommand } from "./learn.js";
 import { addRepoCommand, removeRepoCommand } from "./repo-management.js";
 import chalk from "chalk";
 
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+const pkg = require("../../package.json");
+
 const program = new Command();
 
 program
@@ -17,7 +21,7 @@ program
         chalk.bold.cyan("🦫 Gitybara") +
         " — An AI coding assistant that actually does software development."
     )
-    .version("0.1.0");
+    .version(pkg.version);
 
 program
     .command("init")

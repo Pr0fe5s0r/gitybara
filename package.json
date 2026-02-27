@@ -1,6 +1,6 @@
 {
   "name": "gitybara",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "An AI coding assistant that actually ships code automatically from GitHub issues.",
   "files": [
     "dist",
@@ -8,14 +8,13 @@
   ],
   "type": "module",
   "bin": {
-    "gitybara": "./dist/cli/index.js"
+    "gitybara": "dist/cli/index.js"
   },
   "scripts": {
     "dev": "tsx src/cli/index.ts",
     "build": "tsc",
     "start": "node dist/cli/index.js",
     "lint": "eslint src --ext .ts",
-    "postinstall": "puppeteer browsers install chrome",
     "prepublishOnly": "npm run build"
   },
   "engines": {
