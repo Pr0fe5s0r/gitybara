@@ -1,4 +1,13 @@
 #!/usr/bin/env node
+import { Agent, setGlobalDispatcher } from "undici";
+
+// Increase timeouts for long-running AI prompts (20 minutes)
+setGlobalDispatcher(new Agent({
+    headersTimeout: 20 * 60 * 1000,
+    bodyTimeout: 20 * 60 * 1000,
+    connectTimeout: 60 * 1000,
+}));
+
 import { Command } from "commander";
 import { initCommand } from "./init.js";
 import { startCommand } from "./start.js";

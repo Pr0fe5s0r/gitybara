@@ -87,10 +87,10 @@ async function cleanupOldRuns(config: GlobalConfig) {
                 const fullPath = path.join(reposDir, item);
                 try {
                     const stat = fs.statSync(fullPath);
+                    // No automatic cleanup per user request to avoid EBUSY/data loss.
                     // If older than 30 mins
                     if (now - stat.mtimeMs > 30 * 60 * 1000) {
-                        log.info({ fullPath }, "Cleaning up abandoned run directory");
-                        rimrafSync(fullPath, { maxRetries: 3, retryDelay: 500 });
+                        log.debug({ fullPath }, "Run directory is stale (will not delete automatically)");
                     }
                 } catch (e) {
                     // Ignore
@@ -225,7 +225,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                         log.info({ issue: issue.number, branch: association.branchName, reason: association.reason }, "🤝 Smart Association: Joining existing branch");
                         finalBranchName = association.branchName;
                         isJoiningBranch = true;
-                        
+
                         // Check for actionable comments on the associated PR
                         try {
                             // Find the PR number for this branch
@@ -235,7 +235,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                                 state: "open",
                                 head: `${owner}:${association.branchName}`
                             });
-                            
+
                             if (prResponse.data.length > 0) {
                                 const prNumber = prResponse.data[0].number;
                                 const commentConfig: CommentMonitorConfig = {
@@ -249,13 +249,13 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                                         'update the', 'modify the', 'fix the', 'correct the'
                                     ]
                                 };
-                                
+
                                 const actionableComments = await findActionableComments(
                                     octokit, owner, repo, prNumber, true, commentConfig
                                 );
-                                
+
                                 if (actionableComments.length > 0) {
-                                    log.info({ issue: issue.number, pr: prNumber, comments: actionableComments.length }, 
+                                    log.info({ issue: issue.number, pr: prNumber, comments: actionableComments.length },
                                         `💬 Found ${actionableComments.length} actionable comments on associated PR #${prNumber}`);
                                     // Store the actionable comments to process them after setup
                                     (issue as any).actionableComments = actionableComments;
@@ -402,7 +402,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 }
             );
 
-            if (!result.success || result.filesChanged.length === 0) {
+            if (result.filesChanged.length === 0) {
                 // If the agent intentionally asked for clarification, pause it.
                 if (result.summary.includes("NEED_CLARIFICATION:")) {
                     const match = result.summary.match(/NEED_CLARIFICATION:\s*(.*)/i);
@@ -418,20 +418,28 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                     return; // Exit normally without committing or opening PR
                 }
 
-                // Cleanup isolated directory on standard error
-                await new Promise(r => setTimeout(r, 1000));
-                rimrafSync(workDir, { maxRetries: 10, retryDelay: 500 });
-                throw new Error(
-                    result.filesChanged.length === 0
-                        ? "OpenCode made no file changes"
-                        : `OpenCode failed: ${result.summary}`
+                if (!result.success) {
+                    throw new Error(`OpenCode failed: ${result.summary}`);
+                }
+
+                log.info({ issue: issue.number }, "OpenCode made no file changes, marking as done.");
+                await updateJob(jobId, "done", branchName);
+                await labelIssue(octokit, owner, repo, issue.number, "gitybara:done").catch(() => { });
+                await commentOnIssue(
+                    octokit, owner, repo, issue.number,
+                    `🦫 **Gitybara** reviewed the issue but determined that no code changes are required.\n\n**Summary:**\n${result.summary}`
                 );
+                return;
             }
+
+            // If we have changes but success is false, it's likely a timeout but work was done
+            const finalSummary = result.success ? result.summary :
+                (result.summary || "OpenCode made changes but the request timed out. These changes have been applied for your review.");
 
             // 6. Commit and push
             await git.add(".");
             await git.commit(
-                `fix(#${issue.number}): ${issue.title}\n\nResolved by Gitybara 🦫\n\n${result.summary}`
+                `fix(#${issue.number}): ${issue.title}\n\nResolved by Gitybara 🦫\n\n${finalSummary}`
             );
 
             // Force push if necessary in case branch already existed (push from detached HEAD)
@@ -441,17 +449,17 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             // Check if there are actionable comments to address (from PR review)
             const actionableComments = (issue as any).actionableComments;
             const associatedPRNumber = (issue as any).associatedPRNumber;
-            
+
             if (actionableComments && actionableComments.length > 0 && associatedPRNumber) {
-                log.info({ issue: issue.number, comments: actionableComments.length }, 
+                log.info({ issue: issue.number, comments: actionableComments.length },
                     "Addressing actionable comments from PR review…");
-                
+
                 const fixPrompt = buildFixPrompt(
                     issue.title,
                     issue.body || '',
                     actionableComments
                 );
-                
+
                 const fixResult = await runOpenCode(
                     config.opencodePath,
                     workDir,
@@ -459,7 +467,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                     selectedProvider,
                     selectedModel
                 );
-                
+
                 if (fixResult.success && fixResult.filesChanged.length > 0) {
                     // Commit the fixes
                     await git.add(".");
@@ -467,20 +475,20 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                         `fix(#${issue.number}): Addressed feedback from PR comments\n\n${fixResult.summary}`
                     );
                     await git.push(["-f", remoteWithToken, `HEAD:${finalBranchName}`]);
-                    
+
                     await postFixResponse(
                         octokit, owner, repo, associatedPRNumber, true,
                         fixResult.filesChanged,
                         fixResult.summary
                     );
-                    
-                    log.info({ issue: issue.number, pr: associatedPRNumber }, 
+
+                    log.info({ issue: issue.number, pr: associatedPRNumber },
                         "✅ Successfully addressed PR review comments");
                 }
             }
 
             // 7. Open PR
-            const prBody = buildPRBody(issue.number, issue.title, result.summary, result.filesChanged);
+            const prBody = buildPRBody(issue.number, issue.title, finalSummary, result.filesChanged);
             const pr = await openPR(
                 octokit, owner, repo, branchName, baseBranch,
                 `fix(#${issue.number}): ${issue.title}`, prBody
@@ -489,27 +497,19 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             // 8. Comment on issue with PR link
             await commentOnIssue(
                 octokit, owner, repo, issue.number,
-                `🦫 **Gitybara** finished!\n\nOpened PR: ${pr.url}\n\n**Files changed:** ${result.filesChanged.join(", ")}\n\n**Summary:**\n${result.summary}`
+                `🦫 **Gitybara** finished!\n\nOpened PR: ${pr.url}\n\n**Files changed:** ${result.filesChanged.join(", ")}\n\n**Summary:**\n${finalSummary}`
             );
             await labelIssue(octokit, owner, repo, issue.number, "gitybara:done").catch(() => { });
 
             await updateJob(jobId, "done", branchName, pr.url);
 
-            // Clean up isolated directory
-            try {
-                await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
-            } catch (cleanupErr) {
-                log.warn({ err: cleanupErr, workDir: encodeWorkspacePath(workDir) }, "Failed to remove worktree via git, falling back to rimraf");
-                try {
-                    await new Promise(r => setTimeout(r, 1000));
-                    rimrafSync(workDir, { maxRetries: 10, retryDelay: 500 });
-                } catch (e) { }
-            }
+            // No automatic cleanup per user request
+            log.info({ issue: issue.number, pr: pr.url, workDir: encodeWorkspacePath(workDir) }, "Issue resolved — PR opened, work directory preserved.");
 
             log.info({ issue: issue.number, pr: pr.url }, "✅ Issue resolved — PR opened");
         } catch (err) {
             const errMsg = String(err);
-            
+
             // Check if this was a cancellation
             if (errMsg.includes("cancelled") || abortController.signal.aborted) {
                 log.info({ issue: issue.number }, "🛑 Task was cancelled");
@@ -528,17 +528,8 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 ).catch(() => { });
             }
 
-            // Ensure cleanup even on error
-            if (typeof workDir !== 'undefined' && fs.existsSync(workDir)) {
-                try {
-                    await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
-                } catch {
-                    try {
-                        await new Promise(r => setTimeout(r, 1000));
-                        rimrafSync(workDir, { maxRetries: 10, retryDelay: 500 });
-                    } catch (e) { }
-                }
-            }
+            // No automatic cleanup on error per user request
+            log.info({ issue: issue.number, workDir: encodeWorkspacePath(workDir) }, "Holding worktree after error for debugging or resumption.");
         } finally {
             // Always unregister the task when done
             unregisterTask(jobId);
@@ -567,10 +558,9 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             const sharedGit = simpleGit(clonePath);
 
             try {
-                // Ensure workdir is clean
+                // Ensure workdir doesn't exist
                 if (fs.existsSync(workDir)) {
                     await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
-                    rimrafSync(workDir, { maxRetries: 3 });
                 }
 
                 // Prepare worktree
@@ -619,21 +609,18 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                     log.info({ pr: pr.number }, "No changes to commit after conflict resolution check.");
                 }
 
-                // Cleanup
-                await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
+                // No automatic cleanup per user request
+                log.info({ pr: pr.number, workDir: encodeWorkspacePath(workDir) }, "Conflict resolution complete, work directory preserved.");
             } catch (err) {
                 log.error({ err, pr: pr.number }, "❌ Failed to resolve Conflicts");
                 await commentOnIssue(octokit, owner, repo, pr.number, `🦫 **Gitybara** failed to resolve merge conflicts automatically:\n\`\`\`\n${err}\n\`\`\``).catch(() => { });
 
-                // Cleanup on error
-                if (fs.existsSync(workDir)) {
-                    await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
-                }
+                // No automatic cleanup on error
             }
         } else {
             log.debug({ pr: pr.number }, "Pull Request is mergeable, no action needed.");
         }
-        
+
         // Check for actionable comments on the PR
         try {
             const commentConfig: CommentMonitorConfig = {
@@ -647,42 +634,42 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                     'update the', 'modify the', 'fix the', 'correct the'
                 ]
             };
-            
+
             const actionableComments = await findActionableComments(
                 octokit, owner, repo, pr.number, true, commentConfig
             );
-            
+
             if (actionableComments.length > 0) {
-                log.info({ pr: pr.number, comments: actionableComments.length }, 
+                log.info({ pr: pr.number, comments: actionableComments.length },
                     `💬 Found ${actionableComments.length} actionable comments on PR, applying fixes…`);
-                
+
                 const branchName = fullPR.head.ref;
                 const safeBranchName = branchName.replace(/[^\w.-]/g, "-") + "-comment-fix";
                 const workDir = path.join(path.dirname(clonePath), safeBranchName);
                 const sharedGit = simpleGit(clonePath);
-                
+
                 try {
                     // Ensure workdir is clean
                     if (fs.existsSync(workDir)) {
                         await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
                         rimrafSync(workDir, { maxRetries: 3 });
                     }
-                    
+
                     // Prepare worktree
                     await sharedGit.fetch(["origin", branchName]);
                     await execa("git", ["worktree", "add", "-d", workDir, `origin/${branchName}`], { cwd: clonePath });
-                    
+
                     const git: SimpleGit = simpleGit(workDir);
-                    
+
                     // Build prompt from actionable comments
                     const fixPrompt = buildFixPrompt(
                         fullPR.title,
                         fullPR.body || '',
                         actionableComments
                     );
-                    
+
                     log.info({ pr: pr.number }, "Running OpenCode to address feedback…");
-                    
+
                     const result = await runOpenCode(
                         config.opencodePath,
                         workDir,
@@ -690,11 +677,11 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                         config.defaultProvider,
                         config.defaultModel
                     );
-                    
+
                     if (!result.success) {
                         throw new Error(`OpenCode failed to apply fixes: ${result.summary}`);
                     }
-                    
+
                     if (result.filesChanged.length === 0) {
                         log.info({ pr: pr.number }, "No file changes were made by OpenCode");
                     } else {
@@ -705,26 +692,26 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                             await git.commit(`🦫 Gitybara: Addressed feedback from PR comments`);
                             const remoteWithToken = `https://x-access-token:${config.githubToken}@github.com/${owner}/${repo}.git`;
                             await git.push(["-f", remoteWithToken, `HEAD:${branchName}`]);
-                            
+
                             await postFixResponse(
                                 octokit, owner, repo, pr.number, true,
                                 result.filesChanged,
                                 result.summary
                             );
-                            
+
                             log.info({ pr: pr.number }, "✅ Successfully applied fixes from PR comments");
                         }
                     }
-                    
+
                     // Cleanup
                     await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
                 } catch (err) {
                     log.error({ err, pr: pr.number }, "❌ Failed to apply fixes from comments");
                     await commentOnIssue(
-                        octokit, owner, repo, pr.number, 
+                        octokit, owner, repo, pr.number,
                         `🦫 **Gitybara** failed to automatically apply fixes from the feedback:\n\`\`\`\n${err}\n\`\`\``
                     ).catch(() => { });
-                    
+
                     // Cleanup on error
                     if (fs.existsSync(workDir)) {
                         await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
@@ -753,7 +740,7 @@ async function processIssueComments(
     // Get issues that have associated PRs (from jobs table)
     const { getDb } = await import("../db/index.js");
     const db = getDb();
-    
+
     const rs = await db.execute({
         sql: `SELECT issue_number FROM jobs 
                WHERE repo_owner = ? AND repo_name = ? 
@@ -761,14 +748,14 @@ async function processIssueComments(
                AND pr_url IS NOT NULL`,
         args: [owner, repo]
     });
-    
+
     if (rs.rows.length === 0) {
         return;
     }
-    
+
     const issuesWithPRs = rs.rows.map((r: any) => r.issue_number as number);
     log.info({ issues: issuesWithPRs.length }, `Checking ${issuesWithPRs.length} issues with PRs for actionable comments`);
-    
+
     for (const issueNumber of issuesWithPRs) {
         try {
             // Find the associated PR
@@ -777,17 +764,17 @@ async function processIssueComments(
                 repo,
                 state: "open"
             });
-            
+
             // Find PR that mentions this issue
-            const associatedPR = prs.find((pr: any) => 
-                pr.body?.includes(`#${issueNumber}`) || 
+            const associatedPR = prs.find((pr: any) =>
+                pr.body?.includes(`#${issueNumber}`) ||
                 pr.title?.includes(`#${issueNumber}`)
             );
-            
+
             if (!associatedPR) {
                 continue;
             }
-            
+
             // Check for actionable comments on the issue
             const commentConfig: CommentMonitorConfig = {
                 enabled: true,
@@ -800,53 +787,53 @@ async function processIssueComments(
                     'update the', 'modify the', 'fix the', 'correct the'
                 ]
             };
-            
+
             const actionableComments = await findActionableComments(
                 octokit, owner, repo, issueNumber, false, commentConfig
             );
-            
+
             if (actionableComments.length === 0) {
                 continue;
             }
-            
-            log.info({ issue: issueNumber, pr: associatedPR.number, comments: actionableComments.length }, 
+
+            log.info({ issue: issueNumber, pr: associatedPR.number, comments: actionableComments.length },
                 `💬 Found ${actionableComments.length} actionable comments on issue #${issueNumber}`);
-            
+
             // Process the comments similar to PR comments
             const branchName = associatedPR.head.ref;
             const safeBranchName = branchName.replace(/[^\w.-]/g, "-") + "-issue-comment-fix";
             const workDir = path.join(path.dirname(clonePath), safeBranchName);
             const sharedGit = simpleGit(clonePath);
-            
+
             try {
                 // Ensure workdir is clean
                 if (fs.existsSync(workDir)) {
                     await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
                     rimrafSync(workDir, { maxRetries: 3 });
                 }
-                
+
                 // Prepare worktree
                 await sharedGit.fetch(["origin", branchName]);
                 await execa("git", ["worktree", "add", "-d", workDir, `origin/${branchName}`], { cwd: clonePath });
-                
+
                 const git: SimpleGit = simpleGit(workDir);
-                
+
                 // Get issue details
                 const { data: issue } = await octokit.rest.issues.get({
                     owner,
                     repo,
                     issue_number: issueNumber
                 });
-                
+
                 // Build prompt from actionable comments
                 const fixPrompt = buildFixPrompt(
                     issue.title,
                     issue.body || '',
                     actionableComments
                 );
-                
+
                 log.info({ issue: issueNumber, pr: associatedPR.number }, "Running OpenCode to address issue feedback…");
-                
+
                 const result = await runOpenCode(
                     config.opencodePath,
                     workDir,
@@ -854,11 +841,11 @@ async function processIssueComments(
                     config.defaultProvider,
                     config.defaultModel
                 );
-                
+
                 if (!result.success) {
                     throw new Error(`OpenCode failed to apply fixes: ${result.summary}`);
                 }
-                
+
                 if (result.filesChanged.length === 0) {
                     log.info({ issue: issueNumber }, "No file changes were made by OpenCode");
                 } else {
@@ -869,27 +856,27 @@ async function processIssueComments(
                         await git.commit(`🦫 Gitybara: Addressed feedback from issue #${issueNumber} comments`);
                         const remoteWithToken = `https://x-access-token:${config.githubToken}@github.com/${owner}/${repo}.git`;
                         await git.push(["-f", remoteWithToken, `HEAD:${branchName}`]);
-                        
+
                         await postFixResponse(
                             octokit, owner, repo, associatedPR.number, true,
                             result.filesChanged,
                             result.summary
                         );
-                        
-                        log.info({ issue: issueNumber, pr: associatedPR.number }, 
+
+                        log.info({ issue: issueNumber, pr: associatedPR.number },
                             "✅ Successfully applied fixes from issue comments");
                     }
                 }
-                
+
                 // Cleanup
                 await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
             } catch (err) {
                 log.error({ err, issue: issueNumber }, "❌ Failed to apply fixes from issue comments");
                 await commentOnIssue(
-                    octokit, owner, repo, issueNumber, 
+                    octokit, owner, repo, issueNumber,
                     `🦫 **Gitybara** failed to automatically apply fixes from the feedback on this issue:\n\`\`\`\n${err}\n\`\`\``
                 ).catch(() => { });
-                
+
                 // Cleanup on error
                 if (fs.existsSync(workDir)) {
                     await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });

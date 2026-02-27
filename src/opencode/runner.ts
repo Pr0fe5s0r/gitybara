@@ -5,6 +5,9 @@ import * as net from "net";
 
 const log = createLogger("opencode-runner");
 
+// Mutex to prevent race conditions when changing CWD for SDK initialization
+let sdkInitMutex = Promise.resolve();
+
 /**
  * Encode a workspace path to base64 format for URL-safe identification
  */
@@ -61,19 +64,29 @@ export async function runOpenCode(
     let summary = "";
     let freePort: number | undefined;
     let sessionId: string | undefined;
-
-    // Change process directory temporarily if opencode server relies on CWD
     const originalCwd = process.cwd();
-    process.chdir(workingDir);
+    let opencode: any;
 
     try {
         freePort = await getAvailablePort();
-        const opencode = await createOpencode({
-            port: freePort,
-            config: {
-                model: model && provider ? `${provider}/${model}` : model,
-            }
-        });
+
+        // Use mutex to safely switch CWD for SDK initialization
+        await sdkInitMutex;
+        let resolveMutex: () => void;
+        sdkInitMutex = new Promise(resolve => { resolveMutex = resolve; });
+
+        try {
+            process.chdir(workingDir);
+            opencode = await createOpencode({
+                port: freePort,
+                config: {
+                    model: model && provider ? `${provider}/${model}` : model,
+                }
+            });
+        } finally {
+            process.chdir(originalCwd);
+            resolveMutex!();
+        }
 
         const sessionUrl = `http://localhost:${freePort}`;
 
@@ -150,15 +163,12 @@ export async function runOpenCode(
             success = true;
         }
 
-        // Close server
-        await opencode.server.close();
-
-    } catch (err: unknown) {
-        log.error({ err }, "OpenCode SDK error");
-        summary = String(err);
-        success = false;
     } finally {
-        process.chdir(originalCwd);
+        if (opencode?.server) {
+            try {
+                await opencode.server.close();
+            } catch { }
+        }
     }
 
     // Detect changed files via git

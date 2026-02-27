@@ -28,9 +28,9 @@ const runningTasks = new Map<number, RunningTask>();
  */
 export function registerTask(task: RunningTask): void {
     runningTasks.set(task.jobId, task);
-    log.info({ 
-        jobId: task.jobId, 
-        issue: task.issueNumber, 
+    log.info({
+        jobId: task.jobId,
+        issue: task.issueNumber,
         repo: `${task.repoOwner}/${task.repoName}`
     }, "Task registered");
 }
@@ -68,15 +68,15 @@ export function isTaskRunning(jobId: number): boolean {
  * Cancel a running task by job ID
  */
 export async function cancelTask(
-    jobId: number, 
+    jobId: number,
     force: boolean = false
 ): Promise<{ success: boolean; message: string }> {
     const task = runningTasks.get(jobId);
-    
+
     if (!task) {
-        return { 
-            success: false, 
-            message: `Task ${jobId} is not currently running` 
+        return {
+            success: false,
+            message: `Task ${jobId} is not currently running`
         };
     }
 
@@ -92,7 +92,7 @@ export async function cancelTask(
                 task.process.kill("SIGTERM");
                 // Give it a moment to terminate gracefully
                 await new Promise(resolve => setTimeout(resolve, 1000));
-                
+
                 // Force kill if still running
                 if (task.process.exitCode === null) {
                     task.process.kill("SIGKILL");
@@ -104,41 +104,29 @@ export async function cancelTask(
 
         // Update job status in database
         await updateJob(
-            jobId, 
-            "cancelled", 
-            task.branchName, 
-            undefined, 
+            jobId,
+            "cancelled",
+            task.branchName,
+            undefined,
             `Task cancelled by user${force ? ' (forced)' : ''}`
         );
 
-        // Clean up work directory
-        if (fs.existsSync(task.workDir)) {
-            try {
-                await execa("git", ["worktree", "remove", "--force", task.workDir], { 
-                    cwd: task.clonePath 
-                });
-            } catch {
-                // Fallback to rimraf
-                try {
-                    rimrafSync(task.workDir, { maxRetries: 3, retryDelay: 500 });
-                } catch (e) {
-                    log.warn({ jobId, workDir: encodeWorkspacePath(task.workDir) }, "Failed to cleanup work directory");
-                }
-            }
-        }
+        // No automatic cleanup of work directory per user request.
+        // This prevents EBUSY crashes and allows for manual inspection of cancelled work.
+        log.info({ jobId, workDir: encodeWorkspacePath(task.workDir) }, "Task cancelled, work directory preserved.");
 
         // Remove from registry
         runningTasks.delete(jobId);
 
-        return { 
-            success: true, 
-            message: `Task ${jobId} (Issue #${task.issueNumber} in ${task.repoOwner}/${task.repoName}) has been cancelled` 
+        return {
+            success: true,
+            message: `Task ${jobId} (Issue #${task.issueNumber} in ${task.repoOwner}/${task.repoName}) has been cancelled`
         };
     } catch (err: any) {
         log.error({ jobId, err }, "Error cancelling task");
-        return { 
-            success: false, 
-            message: `Failed to cancel task: ${err.message}` 
+        return {
+            success: false,
+            message: `Failed to cancel task: ${err.message}`
         };
     }
 }
@@ -146,11 +134,11 @@ export async function cancelTask(
 /**
  * Cancel all running tasks
  */
-export async function cancelAllTasks(force: boolean = false): Promise<{ 
-    success: boolean; 
-    cancelled: number; 
+export async function cancelAllTasks(force: boolean = false): Promise<{
+    success: boolean;
+    cancelled: number;
     failed: number;
-    messages: string[] 
+    messages: string[]
 }> {
     const tasks = getRunningTasks();
     const messages: string[] = [];
