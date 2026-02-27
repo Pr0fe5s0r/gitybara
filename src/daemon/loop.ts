@@ -272,7 +272,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 try {
                     await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
                 } catch {
-                    rimrafSync(workDir, { maxRetries: 3, retryDelay: 500 });
+                    log.debug({ workDir }, "Git remove failed, will let periodic cleanup handle it");
                 }
                 await execa("git", ["worktree", "prune"], { cwd: clonePath }).catch(() => { });
             }
@@ -338,8 +338,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 }
 
                 // Cleanup isolated directory on standard error
-                await new Promise(r => setTimeout(r, 1000));
-                rimrafSync(workDir, { maxRetries: 10, retryDelay: 500 });
+                // Will let periodic cleanup handle the folder removal in case of EBUSY
                 throw new Error(
                     result.filesChanged.length === 0
                         ? "OpenCode made no file changes"
@@ -377,11 +376,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             try {
                 await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
             } catch (cleanupErr) {
-                log.warn({ err: cleanupErr, workDir }, "Failed to remove worktree via git, falling back to rimraf");
-                try {
-                    await new Promise(r => setTimeout(r, 1000));
-                    rimrafSync(workDir, { maxRetries: 10, retryDelay: 500 });
-                } catch (e) { }
+                log.warn({ err: cleanupErr, workDir }, "Failed to remove worktree via git. Will let periodic cleanup handle it.");
             }
 
             log.info({ issue: issue.number, pr: pr.url }, "✅ Issue resolved — PR opened");
@@ -399,10 +394,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 try {
                     await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
                 } catch {
-                    try {
-                        await new Promise(r => setTimeout(r, 1000));
-                        rimrafSync(workDir, { maxRetries: 10, retryDelay: 500 });
-                    } catch (e) { }
+                    log.debug({ workDir }, "Failed to remove worktree on error path. Will let periodic cleanup handle it.");
                 }
             }
         }
@@ -430,7 +422,6 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 // Ensure workdir is clean
                 if (fs.existsSync(workDir)) {
                     await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
-                    rimrafSync(workDir, { maxRetries: 3 });
                 }
 
                 // Prepare worktree
