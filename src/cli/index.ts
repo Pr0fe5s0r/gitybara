@@ -4,7 +4,7 @@ import { initCommand } from "./init.js";
 import { startCommand } from "./start.js";
 import { stopCommand } from "./stop.js";
 import { statusCommand } from "./status.js";
-import { configCommand } from "./config.js";
+import { configCommand, configModelCommand } from "./config.js";
 import { learnCommand } from "./learn.js";
 import { addRepoCommand, removeRepoCommand } from "./repo-management.js";
 import chalk from "chalk";
@@ -47,13 +47,20 @@ program
     .option("-j, --json", "Output as JSON")
     .action(statusCommand);
 
-program
+const configCmd = program
     .command("config")
-    .description("View or edit global configuration")
+    .description("View or edit global configuration");
+
+configCmd
     .option("--set <key=value>", "Set a config value")
     .option("--get <key>", "Get a config value")
     .option("--list", "List all config values")
     .action(configCommand);
+
+configCmd
+    .command("model")
+    .description("Configure the default AI model")
+    .action(configModelCommand);
 
 program
     .command("learn")
