@@ -44,7 +44,8 @@ export async function runOpenCode(
     workingDir: string,
     systemPrompt: string,
     provider?: string,
-    model?: string
+    model?: string,
+    onSessionCreated?: (sessionUrl: string) => void | Promise<void>
 ): Promise<RunResult> {
     log.info({ workingDir, model, provider }, "Launching OpenCode session via SDK");
 
@@ -118,6 +119,11 @@ export async function runOpenCode(
         const encodedPath = Buffer.from(normalizedPath).toString("base64").replace(/=/g, "");
         const fullSessionUrl = `${sessionUrl}/${encodedPath}/session/${sessionId}`;
         log.info({ sessionId, sessionUrl: fullSessionUrl }, "OpenCode session created");
+
+        // Notify caller immediately that session is ready
+        if (onSessionCreated) {
+            await onSessionCreated(fullSessionUrl);
+        }
 
         // Send the prompt
         const response = await client.session.prompt({
