@@ -62,8 +62,18 @@ export async function initDb(): Promise<void> {
             status       TEXT DEFAULT 'processed',
             UNIQUE(repo_owner, repo_name, comment_id)
         );`,
-    `CREATE INDEX IF NOT EXISTS idx_processed_comments_repo ON processed_comments(repo_owner, repo_name);`,
+        `CREATE INDEX IF NOT EXISTS idx_processed_comments_repo ON processed_comments(repo_owner, repo_name);`,
         `CREATE INDEX IF NOT EXISTS idx_processed_comments_issue ON processed_comments(issue_number);`,
+        // Table for repository memory (REPO_MEMORY.md content)
+        `CREATE TABLE IF NOT EXISTS repo_memory (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_id      INTEGER NOT NULL REFERENCES repos(id),
+            content      TEXT NOT NULL,
+            created_at   TEXT DEFAULT (datetime('now')),
+            updated_at   TEXT DEFAULT (datetime('now')),
+            UNIQUE(repo_id)
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_repo_memory_repo ON repo_memory(repo_id);`,
         // Table for repository auto-merge configuration
         `CREATE TABLE IF NOT EXISTS repo_auto_merge_config (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,

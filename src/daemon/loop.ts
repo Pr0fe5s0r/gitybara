@@ -14,6 +14,7 @@ import { commentOnIssue, labelIssue, ensureModelLabels, getIssueComments } from 
 import { runOpenCode, encodeWorkspacePath } from "../opencode/runner.js";
 import { getAvailableModels } from "../opencode/models.js";
 import { getRules, buildSystemPrompt } from "../learning/engine.js";
+import { ensureRepoMemory, updateRepoMemoryWithInsights } from "../memory/manager.js";
 import {
     upsertRepo,
     createJob,
@@ -175,6 +176,21 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             } catch (err) {
                 log.warn({ err }, "Failed to update shared repo cache, continuing anyway");
             }
+        }
+
+        // Ensure REPO_MEMORY.md exists for AI agent clarifications
+        try {
+            await ensureRepoMemory(
+                repoId,
+                clonePath,
+                owner,
+                repo,
+                config.opencodePath,
+                config.defaultProvider,
+                config.defaultModel
+            );
+        } catch (memoryErr) {
+            log.warn({ err: memoryErr, owner, repo }, "Failed to ensure REPO_MEMORY.md, continuing anyway");
         }
     }
 
