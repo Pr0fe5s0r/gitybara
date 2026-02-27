@@ -9,6 +9,7 @@ import { GITYBARA_DIR } from "../cli/config-store.js";
 import { analyzeBridgeMessage, planGithubIssue } from "../opencode/runner.js";
 import { createGitHubClient } from "../github/client.js";
 import { createLogger } from "../utils/logger.js";
+import { cancelTask, getRunningTasks } from "../tasks/manager.js";
 
 const logger = createLogger("whatsapp-client");
 const SESSION_PATH = path.join(GITYBARA_DIR, "sessions", "whatsapp");
@@ -146,6 +147,47 @@ export async function startWhatsappDaemon(
         }
 
         const state = states.get(ownerId) || { step: "IDLE" };
+
+        // Handle stop/cancel commands
+        const lowerText = text.toLowerCase();
+        if (lowerText === "stop" || lowerText === "cancel") {
+            const tasks = getRunningTasks();
+            if (tasks.length === 0) {
+                await sendTagged(client, ownerId, "🦫 No tasks are currently running.");
+                return;
+            }
+            
+            // Cancel the most recently started task
+            const mostRecentTask = tasks[tasks.length - 1];
+            await sendTagged(client, ownerId, `🛑 Cancelling task for Issue #${mostRecentTask.issueNumber} in ${mostRecentTask.repoOwner}/${mostRecentTask.repoName}...`);
+            
+            const result = await cancelTask(mostRecentTask.jobId);
+            if (result.success) {
+                await sendTagged(client, ownerId, `✅ Task cancelled successfully!`);
+            } else {
+                await sendTagged(client, ownerId, `❌ Failed to cancel: ${result.message}`);
+            }
+            return;
+        }
+
+        // Handle "tasks" command to list running tasks
+        if (lowerText === "tasks" || lowerText === "status") {
+            const tasks = getRunningTasks();
+            if (tasks.length === 0) {
+                await sendTagged(client, ownerId, "🦫 No tasks are currently running.");
+            } else {
+                let message = `🦫 *Running Tasks (${tasks.length}):*\n\n`;
+                tasks.forEach((task, i) => {
+                    const duration = Math.floor((Date.now() - task.startedAt.getTime()) / 1000 / 60);
+                    message += `${i + 1}. Issue #${task.issueNumber} in ${task.repoOwner}/${task.repoName}\n`;
+                    message += `   Branch: ${task.branchName}\n`;
+                    message += `   Duration: ${duration}m\n\n`;
+                });
+                message += `Reply "stop" to cancel the most recent task.`;
+                await sendTagged(client, ownerId, message);
+            }
+            return;
+        }
 
         if (state.step === "IDLE") {
             logger.info({ text: text.substring(0, 50) + "..." }, "Processing new message from owner...");
