@@ -30,7 +30,7 @@ export async function buildSystemPrompt(
     issueTitle: string,
     issueBody: string,
     rules: Rule[],
-    comments?: string[],
+    comments?: { body: string, user: { login: string } }[],
     repoId?: number
 ): Promise<string> {
     const doRules = rules.filter((r) => r.type === "do");
@@ -51,7 +51,7 @@ ${dontRules.length > 0 ? `\n### NEVER:\n${dontRules.map((r) => `- ${r.text}`).jo
         commentsSection = `
 ## Ongoing Conversation
 The following comments have been added to the issue by the user and the bot:
-${comments.map((c, i) => `Comment ${i + 1}:\n${c}`).join("\n\n")}
+${comments.map((c, i) => `Comment ${i + 1} from @${c.user.login}:\n${c.body}`).join("\n\n")}
 `.trim();
     }
 

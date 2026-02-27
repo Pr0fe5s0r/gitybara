@@ -91,12 +91,14 @@ export async function commentOnIssue(
     }));
 }
 
+import { PRComment } from "./prs.js";
+
 export async function getIssueComments(
     octokit: Octokit,
     owner: string,
     repo: string,
     issueNumber: number
-): Promise<string[]> {
+): Promise<PRComment[]> {
     const { data } = await withRetry(() => octokit.rest.issues.listComments({
         owner,
         repo,
@@ -104,7 +106,17 @@ export async function getIssueComments(
         per_page: 100, // Fetch up to 100 comments
     }));
 
-    return data.map((comment: any) => comment.body || "");
+    return data.map((comment: any) => ({
+        id: comment.id,
+        body: comment.body || "",
+        user: {
+            login: comment.user?.login || "unknown",
+            type: comment.user?.type || "User"
+        },
+        created_at: comment.created_at,
+        updated_at: comment.updated_at,
+        html_url: comment.html_url
+    }));
 }
 
 export async function ensureModelLabels(

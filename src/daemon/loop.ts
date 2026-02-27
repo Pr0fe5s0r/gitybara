@@ -9,7 +9,7 @@ import { GlobalConfig, RepoConfig } from "../cli/config-store.js";
 import { createGitHubClient } from "../github/client.js";
 import { listOpenIssues } from "../github/issues.js";
 import { createBranch, issueToBranchName } from "../github/branches.js";
-import { openPR, listOpenPRs, getPR } from "../github/prs.js";
+import { openPR, listOpenPRs, getPR, enableAutoMerge, mergePullRequest, isAutoMergeEnabled } from "../github/prs.js";
 import { commentOnIssue, labelIssue, ensureModelLabels, getIssueComments } from "../github/issues.js";
 import { runOpenCode, encodeWorkspacePath } from "../opencode/runner.js";
 import { getAvailableModels } from "../opencode/models.js";
@@ -20,7 +20,15 @@ import {
     createJob,
     updateJob,
     getJobByIssue,
-    cancelJob
+    cancelJob,
+    getRepoAutoMergeConfig,
+    getPRAutoMergeConfig,
+    RepoAutoMergeConfig,
+    getActionForFile,
+    createConflictResolutionAttempt,
+    updateConflictResolutionAttempt,
+    getFailedResolutionAttemptCount,
+    getConflictResolutionHistory
 } from "../db/index.js";
 import { createLogger } from "../utils/logger.js";
 import { registerTask, unregisterTask, cancelTask } from "../tasks/manager.js";
@@ -193,14 +201,50 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
         const existingJob = await getJobByIssue(owner, repo, issue.number);
         const comments = await getIssueComments(octokit, owner, repo, issue.number);
 
+        const jobId = existingJob ? existingJob.id : await createJob(repoId, owner, repo, issue.number, issue.title);
+
         if (existingJob) {
-            if (existingJob.status === "done" || existingJob.status === "in-progress") {
-                log.debug({ issue: issue.number }, "Already processed or in-progress, skipping");
-                return;
+            if (existingJob.status === "done") {
+                // If the user removed the 'done' label, they want us to try again.
+                if (!issue.labels.includes("gitybara:done")) {
+                    log.info({ issue: issue.number }, "Label 'gitybara:done' removed, re-evaluating issue.");
+                    await updateJob(jobId, "pending", existingJob.branch || "");
+                } else {
+                    // Still marked as done. Check for actionable comments.
+                    const commentConfig: CommentMonitorConfig = {
+                        enabled: true,
+                        autoApplyFixes: true,
+                        skipBotComments: true,
+                        actionableKeywords: [
+                            'fix', 'change', 'update', 'modify', 'correct', 'improve',
+                            'please fix', 'can you fix', 'need to fix', 'should fix',
+                            'change request', 'requested changes', 'please address',
+                            'update the', 'modify the', 'fix the', 'correct the'
+                        ]
+                    };
+
+                    const actionable = await findActionableComments(octokit, owner, repo, issue.number, false, commentConfig);
+                    if (actionable.length > 0) {
+                        log.info({ issue: issue.number }, "Found new actionable comments on 'done' issue, re-opening.");
+                        await updateJob(jobId, "pending", existingJob.branch || "");
+                    } else {
+                        log.debug({ issue: issue.number }, "Issue is already marked as 'done', skipping.");
+                        return;
+                    }
+                }
+            } else if (existingJob.status === "in-progress") {
+                // Check if it's actually running in this process
+                const { getRunningTask } = await import("../tasks/manager.js");
+                if (getRunningTask(jobId)) {
+                    log.debug({ issue: issue.number }, "Already in-progress in this runner, skipping");
+                    return;
+                }
+                log.info({ issue: issue.number }, "Found stale in-progress job, resetting to allow resumption");
+                await updateJob(jobId, "pending", existingJob.branch || "");
             }
             if (existingJob.status === "waiting") {
                 // If the last comment starts with Gitybara, the user hasn't replied yet
-                if (comments.length > 0 && comments[comments.length - 1].includes("🦫 **Gitybara** needs clarification:")) {
+                if (comments.length > 0 && comments[comments.length - 1].body.includes("🦫 **Gitybara** needs clarification:")) {
                     log.debug({ issue: issue.number }, "Still waiting for user clarification, skipping");
                     return;
                 }
@@ -288,7 +332,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             }
         }
 
-        const jobId = existingJob ? existingJob.id : await createJob(repoId, owner, repo, issue.number, issue.title);
+        // jobId is already defined above
 
         // Create abort controller for this task
         const abortController = new AbortController();
@@ -356,11 +400,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
 
             // Ensure old worktree from previous crash doesn't exist
             if (fs.existsSync(workDir)) {
-                try {
-                    await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
-                } catch {
-                    rimrafSync(workDir, { maxRetries: 3, retryDelay: 500 });
-                }
+                await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
                 await execa("git", ["worktree", "prune"], { cwd: clonePath }).catch(() => { });
             }
 
@@ -558,20 +598,105 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
     // Process actionable comments on issues with existing PRs
     await processIssueComments(octokit, owner, repo, clonePath, config, limit);
 
-    // Process PRs for conflicts
+    // Process PRs for conflicts and auto-merge
     const prPromises = candidatePRs.map(pr => limit(async () => {
         // Detailed check for merge state
         const fullPR = await getPR(octokit, owner, repo, pr.number);
 
-        // mergeable_state: 'dirty' means conflicts
-        // mergeable: false means conflicts
-        if (fullPR.mergeable_state === "dirty" || fullPR.mergeable === false) {
+        // Get auto-merge configuration
+        const repoAutoMergeConfig = await getRepoAutoMergeConfig(repoId);
+        const prAutoMergeConfig = await getPRAutoMergeConfig(owner, repo, pr.number);
+        
+        // Determine effective configuration (PR config overrides repo config)
+        const autoMergeEnabled = prAutoMergeConfig?.enabled ?? repoAutoMergeConfig?.enabled ?? true;
+        const autoMergeClean = prAutoMergeConfig?.enabled !== undefined 
+            ? prAutoMergeConfig.enabled 
+            : (repoAutoMergeConfig?.auto_merge_clean ?? true);
+        const autoResolveConflicts = repoAutoMergeConfig?.auto_resolve_conflicts ?? true;
+        const mergeMethod = (prAutoMergeConfig?.merge_method ?? repoAutoMergeConfig?.merge_method ?? 'merge') as 'merge' | 'squash' | 'rebase';
+
+        // Smart conflict detection and auto-merge logic
+        const hasConflicts = fullPR.mergeable_state === "dirty" || fullPR.mergeable === false;
+        const isMergeable = fullPR.mergeable === true && !hasConflicts;
+
+        // Handle mergeable PRs with auto-merge
+        if (isMergeable && autoMergeEnabled && autoMergeClean) {
+            log.info({ pr: pr.number }, "📥 PR is mergeable, attempting auto-merge…");
+            
+            const autoMergeResult = await enableAutoMerge(
+                octokit, owner, repo, pr.number, 
+                mergeMethod.toUpperCase() as 'MERGE' | 'SQUASH' | 'REBASE'
+            );
+            
+            if (autoMergeResult.success) {
+                log.info({ pr: pr.number }, `✅ Auto-merge enabled for PR: ${autoMergeResult.message}`);
+                await commentOnIssue(
+                    octokit, owner, repo, pr.number, 
+                    `🦫 **Gitybara** has enabled auto-merge for this PR using the **${mergeMethod}** method. The PR will be merged automatically when all checks pass.`
+                ).catch(() => { });
+            } else {
+                log.warn({ pr: pr.number }, `⚠️ Could not enable auto-merge: ${autoMergeResult.message}`);
+                
+                // Try direct merge if auto-merge is not available
+                if (autoMergeResult.message.includes('not enabled for this repository')) {
+                    const directMerge = await mergePullRequest(
+                        octokit, owner, repo, pr.number, mergeMethod,
+                        `🦫 Auto-merge: ${fullPR.title}`,
+                        `This PR was automatically merged by Gitybara when it became mergeable.`
+                    );
+                    
+                    if (directMerge.success) {
+                        log.info({ pr: pr.number }, `✅ Directly merged PR: ${directMerge.message}`);
+                        await commentOnIssue(
+                            octokit, owner, repo, pr.number,
+                            `🦫 **Gitybara** has automatically merged this PR using the **${mergeMethod}** method.`
+                        ).catch(() => { });
+                    } else {
+                        log.warn({ pr: pr.number }, `⚠️ Could not merge: ${directMerge.message}`);
+                    }
+                }
+            }
+            return; // Skip to next PR after handling mergeable state
+        }
+
+        // Handle conflicting PRs with auto-resolution
+        if (hasConflicts && autoResolveConflicts) {
             log.info({ pr: pr.number }, "🔍 Conflict detected on Pull Request, attempting auto-fix…");
+
+            // Check if PR is stale (not updated for X days)
+            const lastUpdated = new Date(fullPR.updated_at);
+            const daysSinceUpdate = (Date.now() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
+            const stalePrDays = repoAutoMergeConfig?.stale_pr_days ?? 7;
+            
+            if (daysSinceUpdate < stalePrDays) {
+                log.info({ pr: pr.number, daysSinceUpdate, stalePrDays }, "PR is not stale yet, skipping conflict resolution.");
+            } else {
+                log.info({ pr: pr.number, daysSinceUpdate, stalePrDays }, "PR is stale, proceeding with conflict resolution.");
+            }
+
+            // Check max resolution attempts
+            const maxAttempts = repoAutoMergeConfig?.max_resolution_attempts ?? 3;
+            const failedAttempts = await getFailedResolutionAttemptCount(owner, repo, pr.number);
+            
+            if (failedAttempts >= maxAttempts) {
+                log.warn({ pr: pr.number, failedAttempts, maxAttempts }, "Max resolution attempts reached, escalating to human review.");
+                await commentOnIssue(
+                    octokit, owner, repo, pr.number,
+                    `🦫 **Gitybara** has attempted to resolve conflicts ${failedAttempts} times without success. This PR requires manual intervention.`
+                ).catch(() => { });
+                return;
+            }
 
             const branchName = fullPR.head.ref;
             const safeBranchName = branchName.replace(/[^\w.-]/g, "-") + "-conflict-fix";
             const workDir = path.join(path.dirname(clonePath), safeBranchName);
             const sharedGit = simpleGit(clonePath);
+
+            // Track resolution attempt
+            let attemptId: number | null = null;
+            const startTime = Date.now();
+            let resolvedFiles: string[] = [];
+            let escalatedFiles: string[] = [];
 
             try {
                 // Ensure workdir doesn't exist
@@ -587,40 +712,161 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
 
                 // Attempt to merge base branch (e.g. main)
                 log.info({ pr: pr.number, base: fullPR.base.ref }, "Merging base branch into PR branch…");
+                let resolvedByAI = false;
+                let conflictedFiles: string[] = [];
+                
                 try {
                     await sharedGit.fetch(["origin", fullPR.base.ref]);
                     await execa("git", ["merge", `origin/${fullPR.base.ref}`], { cwd: workDir });
                     log.info({ pr: pr.number }, "✅ No actual conflicts (Fast-forward or clean merge), pushing update.");
                 } catch (mergeErr) {
-                    log.info({ pr: pr.number }, "⚡ Conflict detected, calling OpenCode for resolution…");
+                    log.info({ pr: pr.number }, "⚡ Conflict detected, analyzing conflicted files…");
 
-                    // Conflict markers are now in the files. OpenCode should fix them.
-                    const rules = await getRules(repoId);
-                    const prompt = `There is a merge conflict in this Pull Request (#${pr.number}).\n\nIssue context: ${fullPR.title}\n\nExisting files contain Git conflict markers. Please resolve all conflicts, ensure the code is functional, and remove all markers.\n\nRules:\n${rules.map(r => `- ${r.text}`).join("\n")}`;
+                    // Get list of conflicted files
+                    const status = await git.status();
+                    conflictedFiles = status.conflicted;
+                    
+                    if (conflictedFiles.length === 0) {
+                        log.info({ pr: pr.number }, "No conflicted files found after merge attempt.");
+                    } else {
+                        log.info({ pr: pr.number, files: conflictedFiles }, `Found ${conflictedFiles.length} conflicted files`);
+                        
+                        // Create tracking record
+                        attemptId = await createConflictResolutionAttempt(
+                            owner, repo, pr.number, fullPR.title, conflictedFiles
+                        );
 
-                    const result = await runOpenCode(
-                        config.opencodePath,
-                        workDir,
-                        prompt,
-                        config.defaultProvider,
-                        config.defaultModel
-                    );
+                        // Categorize files based on patterns
+                        const filesToResolve: string[] = [];
+                        const filesToEscalate: string[] = [];
+                        
+                        for (const file of conflictedFiles) {
+                            const action = await getActionForFile(repoId, file);
+                            if (action === 'escalate') {
+                                filesToEscalate.push(file);
+                            } else if (action === 'ignore') {
+                                log.info({ pr: pr.number, file }, `Ignoring conflicts in ${file} per pattern rules`);
+                            } else {
+                                filesToResolve.push(file);
+                            }
+                        }
 
-                    if (!result.success) {
-                        throw new Error(`OpenCode failed to resolve conflicts: ${result.summary}`);
+                        // If any files need escalation, escalate the entire PR
+                        if (filesToEscalate.length > 0) {
+                            log.warn({ pr: pr.number, files: filesToEscalate }, `Escalating PR due to protected files: ${filesToEscalate.join(', ')}`);
+                            escalatedFiles = filesToEscalate;
+                            
+                            if (attemptId) {
+                                await updateConflictResolutionAttempt(
+                                    attemptId,
+                                    'escalated',
+                                    resolvedFiles,
+                                    escalatedFiles,
+                                    `Escalated due to protected files: ${filesToEscalate.join(', ')}`,
+                                    Date.now() - startTime
+                                );
+                            }
+                            
+                            await commentOnIssue(
+                                octokit, owner, repo, pr.number,
+                                `🦫 **Gitybara** detected conflicts in protected files that require manual review:\n\n${filesToEscalate.map(f => `- \`${f}\``).join('\n')}\n\nPlease resolve these conflicts manually.`
+                            ).catch(() => { });
+                            
+                            // Cleanup worktree
+                            await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
+                            return;
+                        }
+
+                        // If no files to resolve (all ignored), skip
+                        if (filesToResolve.length === 0) {
+                            log.info({ pr: pr.number }, "All conflicted files are set to ignore, skipping resolution.");
+                            if (attemptId) {
+                                await updateConflictResolutionAttempt(
+                                    attemptId,
+                                    'success',
+                                    [],
+                                    [],
+                                    'All conflicted files were ignored per pattern rules',
+                                    Date.now() - startTime
+                                );
+                            }
+                            await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
+                            return;
+                        }
+
+                        log.info({ pr: pr.number, files: filesToResolve }, `Attempting to resolve ${filesToResolve.length} files with OpenCode…`);
+
+                        // Conflict markers are now in the files. OpenCode should fix them.
+                        const rules = await getRules(repoId);
+                        const prompt = `There is a merge conflict in this Pull Request (#${pr.number}).\n\nIssue context: ${fullPR.title}\n\nThe following files have Git conflict markers that need to be resolved:\n${filesToResolve.map(f => `- ${f}`).join('\n')}\n\nPlease resolve all conflicts in these files, ensure the code is functional, and remove all conflict markers.\n\nRules:\n${rules.map(r => `- ${r.text}`).join("\n")}`;
+
+                        const result = await runOpenCode(
+                            config.opencodePath,
+                            workDir,
+                            prompt,
+                            config.defaultProvider,
+                            config.defaultModel
+                        );
+
+                        if (!result.success) {
+                            throw new Error(`OpenCode failed to resolve conflicts: ${result.summary}`);
+                        }
+                        
+                        resolvedByAI = true;
+                        resolvedFiles = filesToResolve;
+                        log.info({ pr: pr.number, files: resolvedFiles }, "✅ OpenCode resolved conflicts.");
+
+                        // Update tracking record
+                        if (attemptId) {
+                            await updateConflictResolutionAttempt(
+                                attemptId,
+                                'success',
+                                resolvedFiles,
+                                escalatedFiles,
+                                undefined,
+                                Date.now() - startTime
+                            );
+                        }
                     }
-                    log.info({ pr: pr.number }, "✅ OpenCode resolved conflicts.");
                 }
 
                 // Commit and push
                 await git.add(".");
                 const status = await git.status();
                 if (status.staged.length > 0) {
-                    await git.commit(`🦫 Gitybara: Auto-resolved merge conflicts with ${fullPR.base.ref}`);
+                    const commitMsg = resolvedByAI 
+                        ? `🦫 Gitybara: Auto-resolved merge conflicts with ${fullPR.base.ref} using AI`
+                        : `🦫 Gitybara: Auto-merged ${fullPR.base.ref} (no conflicts)`;
+                    
+                    await git.commit(commitMsg);
                     const remoteWithToken = `https://x-access-token:${config.githubToken}@github.com/${owner}/${repo}.git`;
                     await git.push(["-f", remoteWithToken, `HEAD:${branchName}`]);
 
-                    await commentOnIssue(octokit, owner, repo, pr.number, "🦫 **Gitybara** has automatically detected and resolved merge conflicts in this PR!");
+                    const resolutionMessage = resolvedByAI 
+                        ? `🦫 **Gitybara** has automatically detected and resolved merge conflicts in this PR!\n\nResolved files:\n${resolvedFiles.map(f => `- \`${f}\``).join('\n')}`
+                        : `🦫 **Gitybara** has automatically updated this PR with the latest changes from ${fullPR.base.ref}.`;
+                    
+                    await commentOnIssue(
+                        octokit, owner, repo, pr.number, 
+                        resolutionMessage
+                    );
+                    
+                    // Check if we should enable auto-merge after conflict resolution
+                    if (autoMergeEnabled) {
+                        log.info({ pr: pr.number }, "Attempting to enable auto-merge after conflict resolution…");
+                        const autoMergeResult = await enableAutoMerge(
+                            octokit, owner, repo, pr.number,
+                            mergeMethod.toUpperCase() as 'MERGE' | 'SQUASH' | 'REBASE'
+                        );
+                        
+                        if (autoMergeResult.success) {
+                            log.info({ pr: pr.number }, `✅ Auto-merge enabled after conflict resolution`);
+                            await commentOnIssue(
+                                octokit, owner, repo, pr.number,
+                                `🦫 Auto-merge has been enabled. The PR will merge automatically when all checks pass.`
+                            ).catch(() => { });
+                        }
+                    }
                 } else {
                     log.info({ pr: pr.number }, "No changes to commit after conflict resolution check.");
                 }
@@ -628,11 +874,41 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 // No automatic cleanup per user request
                 log.info({ pr: pr.number, workDir: encodeWorkspacePath(workDir) }, "Conflict resolution complete, work directory preserved.");
             } catch (err) {
+                const errorMsg = String(err);
                 log.error({ err, pr: pr.number }, "❌ Failed to resolve Conflicts");
-                await commentOnIssue(octokit, owner, repo, pr.number, `🦫 **Gitybara** failed to resolve merge conflicts automatically:\n\`\`\`\n${err}\n\`\`\``).catch(() => { });
+                
+                // Update tracking record with failure
+                if (attemptId) {
+                    await updateConflictResolutionAttempt(
+                        attemptId,
+                        'failed',
+                        resolvedFiles,
+                        escalatedFiles,
+                        errorMsg,
+                        Date.now() - startTime
+                    );
+                }
+                
+                // Check if we've hit max attempts
+                const updatedFailedAttempts = await getFailedResolutionAttemptCount(owner, repo, pr.number);
+                const remainingAttempts = maxAttempts - updatedFailedAttempts;
+                
+                if (remainingAttempts <= 0) {
+                    await commentOnIssue(
+                        octokit, owner, repo, pr.number,
+                        `🦫 **Gitybara** failed to resolve merge conflicts automatically after ${maxAttempts} attempts. This PR requires manual intervention.\n\nError:\n\`\`\`\n${errorMsg}\n\`\`\``
+                    ).catch(() => { });
+                } else {
+                    await commentOnIssue(
+                        octokit, owner, repo, pr.number,
+                        `🦫 **Gitybara** failed to resolve merge conflicts automatically. Will retry on next poll. (${remainingAttempts} attempts remaining)\n\nError:\n\`\`\`\n${errorMsg}\n\`\`\``
+                    ).catch(() => { });
+                }
 
                 // No automatic cleanup on error
             }
+        } else if (hasConflicts && !autoResolveConflicts) {
+            log.info({ pr: pr.number }, "⏸️ Conflicts detected but auto-resolution is disabled for this repository.");
         } else {
             log.debug({ pr: pr.number }, "Pull Request is mergeable, no action needed.");
         }
@@ -668,7 +944,6 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                     // Ensure workdir is clean
                     if (fs.existsSync(workDir)) {
                         await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
-                        rimrafSync(workDir, { maxRetries: 3 });
                     }
 
                     // Prepare worktree
@@ -758,10 +1033,9 @@ async function processIssueComments(
     const db = getDb();
 
     const rs = await db.execute({
-        sql: `SELECT issue_number FROM jobs 
+        sql: `SELECT issue_number, pr_url FROM jobs 
                WHERE repo_owner = ? AND repo_name = ? 
-               AND status = 'done' 
-               AND pr_url IS NOT NULL`,
+               AND status = 'done'`,
         args: [owner, repo]
     });
 
@@ -769,25 +1043,33 @@ async function processIssueComments(
         return;
     }
 
-    const issuesWithPRs = rs.rows.map((r: any) => r.issue_number as number);
-    log.info({ issues: issuesWithPRs.length }, `Checking ${issuesWithPRs.length} issues with PRs for actionable comments`);
+    const issuesWithDoneJobs = rs.rows.map((r: any) => ({
+        number: r.issue_number as number,
+        prUrl: r.pr_url as string | null
+    }));
+    log.info({ count: issuesWithDoneJobs.length }, `Checking ${issuesWithDoneJobs.length} 'done' jobs for actionable comments`);
 
-    for (const issueNumber of issuesWithPRs) {
+    for (const item of issuesWithDoneJobs) {
+        const issueNumber = item.number;
         try {
-            // Find the associated PR
-            const { data: prs } = await octokit.rest.pulls.list({
-                owner,
-                repo,
-                state: "open"
-            });
+            // If it has a PR, find it
+            let associatedPR: any = null;
+            if (item.prUrl) {
+                const { data: prs } = await octokit.rest.pulls.list({
+                    owner,
+                    repo,
+                    state: "open"
+                });
 
-            // Find PR that mentions this issue
-            const associatedPR = prs.find((pr: any) =>
-                pr.body?.includes(`#${issueNumber}`) ||
-                pr.title?.includes(`#${issueNumber}`)
-            );
+                associatedPR = prs.find((pr: any) =>
+                    pr.html_url === item.prUrl ||
+                    pr.body?.includes(`#${issueNumber}`) ||
+                    pr.title?.includes(`#${issueNumber}`)
+                );
+            }
 
-            if (!associatedPR) {
+            if (!associatedPR && item.prUrl) {
+                // PR existed once but now gone?
                 continue;
             }
 
@@ -812,8 +1094,23 @@ async function processIssueComments(
                 continue;
             }
 
-            log.info({ issue: issueNumber, pr: associatedPR.number, comments: actionableComments.length },
-                `💬 Found ${actionableComments.length} actionable comments on issue #${issueNumber}`);
+            if (associatedPR) {
+                log.info({ issue: issueNumber, pr: associatedPR.number, comments: actionableComments.length },
+                    `💬 Found ${actionableComments.length} actionable comments on issue #${issueNumber} with PR #${associatedPR.number}`);
+            } else {
+                log.info({ issue: issueNumber, comments: actionableComments.length },
+                    `💬 Found ${actionableComments.length} actionable comments on issue #${issueNumber} (no PR yet).`);
+
+                // If no PR yet, we should just reset the job to 'pending'
+                // This will cause the main loop to pick it up and run a full cycle
+                const jobId = (await getJobByIssue(owner, repo, issueNumber))?.id;
+                if (jobId) {
+                    await updateJob(jobId, "pending", "");
+                    await labelIssue(octokit, owner, repo, issueNumber, "gitybara:in-progress").catch(() => { });
+                    await commentOnIssue(octokit, owner, repo, issueNumber, `🦫 **Gitybara** is re-opening this issue based on your feedback!`).catch(() => { });
+                }
+                continue;
+            }
 
             // Process the comments similar to PR comments
             const branchName = associatedPR.head.ref;
@@ -825,7 +1122,6 @@ async function processIssueComments(
                 // Ensure workdir is clean
                 if (fs.existsSync(workDir)) {
                     await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
-                    rimrafSync(workDir, { maxRetries: 3 });
                 }
 
                 // Prepare worktree
