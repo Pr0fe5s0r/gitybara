@@ -62,8 +62,36 @@ export async function initDb(): Promise<void> {
             status       TEXT DEFAULT 'processed',
             UNIQUE(repo_owner, repo_name, comment_id)
         );`,
-        `CREATE INDEX IF NOT EXISTS idx_processed_comments_repo ON processed_comments(repo_owner, repo_name);`,
-        `CREATE INDEX IF NOT EXISTS idx_processed_comments_issue ON processed_comments(issue_number);`
+    `CREATE INDEX IF NOT EXISTS idx_processed_comments_repo ON processed_comments(repo_owner, repo_name);`,
+        `CREATE INDEX IF NOT EXISTS idx_processed_comments_issue ON processed_comments(issue_number);`,
+        // Table for repository auto-merge configuration
+        `CREATE TABLE IF NOT EXISTS repo_auto_merge_config (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_id         INTEGER NOT NULL REFERENCES repos(id),
+            enabled         INTEGER DEFAULT 1,
+            auto_merge_clean INTEGER DEFAULT 1,
+            auto_resolve_conflicts INTEGER DEFAULT 1,
+            merge_method    TEXT DEFAULT 'merge' CHECK(merge_method IN ('merge', 'squash', 'rebase')),
+            require_checks  INTEGER DEFAULT 0,
+            require_reviews INTEGER DEFAULT 0,
+            created_at      TEXT DEFAULT (datetime('now')),
+            updated_at      TEXT DEFAULT (datetime('now')),
+            UNIQUE(repo_id)
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_repo_auto_merge ON repo_auto_merge_config(repo_id);`,
+        // Table for PR-specific auto-merge configuration
+        `CREATE TABLE IF NOT EXISTS pr_auto_merge_config (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_owner      TEXT NOT NULL,
+            repo_name       TEXT NOT NULL,
+            pr_number       INTEGER NOT NULL,
+            enabled         INTEGER DEFAULT 1,
+            merge_method    TEXT DEFAULT 'merge' CHECK(merge_method IN ('merge', 'squash', 'rebase')),
+            created_at      TEXT DEFAULT (datetime('now')),
+            updated_at      TEXT DEFAULT (datetime('now')),
+            UNIQUE(repo_owner, repo_name, pr_number)
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_pr_auto_merge ON pr_auto_merge_config(repo_owner, repo_name, pr_number);`
     ], "write");
 
     // Migration: Add force_new_branch to existing jobs table if missing
@@ -284,4 +312,124 @@ export async function getLastProcessedCommentTime(
     });
     if (rs.rows.length === 0 || !rs.rows[0].last_time) return null;
     return rs.rows[0].last_time as string;
+}
+
+export interface RepoAutoMergeConfig {
+    id: number;
+    repo_id: number;
+    enabled: number;
+    auto_merge_clean: number;
+    auto_resolve_conflicts: number;
+    merge_method: 'merge' | 'squash' | 'rebase';
+    require_checks: number;
+    require_reviews: number;
+    created_at: string;
+    updated_at: string;
+}
+
+export interface PRAutoMergeConfig {
+    id: number;
+    repo_owner: string;
+    repo_name: string;
+    pr_number: number;
+    enabled: number;
+    merge_method: 'merge' | 'squash' | 'rebase';
+    created_at: string;
+    updated_at: string;
+}
+
+/**
+ * Get or create auto-merge configuration for a repository
+ */
+export async function getRepoAutoMergeConfig(repoId: number): Promise<RepoAutoMergeConfig | null> {
+    const rs = await getDb().execute({
+        sql: `SELECT * FROM repo_auto_merge_config WHERE repo_id = ?`,
+        args: [repoId]
+    });
+    if (rs.rows.length === 0) {
+        // Create default config
+        await getDb().execute({
+            sql: `INSERT INTO repo_auto_merge_config (repo_id, enabled, auto_merge_clean, auto_resolve_conflicts, merge_method)
+                  VALUES (?, 1, 1, 1, 'merge')`,
+            args: [repoId]
+        });
+        return getRepoAutoMergeConfig(repoId);
+    }
+    return rs.rows[0] as unknown as RepoAutoMergeConfig;
+}
+
+/**
+ * Update repository auto-merge configuration
+ */
+export async function updateRepoAutoMergeConfig(
+    repoId: number,
+    config: Partial<Omit<RepoAutoMergeConfig, 'id' | 'repo_id' | 'created_at' | 'updated_at'>>
+): Promise<void> {
+    const fields: string[] = [];
+    const args: (string | number)[] = [];
+    
+    if (config.enabled !== undefined) { fields.push('enabled = ?'); args.push(config.enabled); }
+    if (config.auto_merge_clean !== undefined) { fields.push('auto_merge_clean = ?'); args.push(config.auto_merge_clean); }
+    if (config.auto_resolve_conflicts !== undefined) { fields.push('auto_resolve_conflicts = ?'); args.push(config.auto_resolve_conflicts); }
+    if (config.merge_method !== undefined) { fields.push('merge_method = ?'); args.push(config.merge_method); }
+    if (config.require_checks !== undefined) { fields.push('require_checks = ?'); args.push(config.require_checks); }
+    if (config.require_reviews !== undefined) { fields.push('require_reviews = ?'); args.push(config.require_reviews); }
+    
+    if (fields.length === 0) return;
+    
+    fields.push('updated_at = datetime("now")');
+    args.push(repoId);
+    
+    await getDb().execute({
+        sql: `UPDATE repo_auto_merge_config SET ${fields.join(', ')} WHERE repo_id = ?`,
+        args
+    });
+}
+
+/**
+ * Get or create auto-merge configuration for a specific PR
+ */
+export async function getPRAutoMergeConfig(
+    repoOwner: string,
+    repoName: string,
+    prNumber: number
+): Promise<PRAutoMergeConfig | null> {
+    const rs = await getDb().execute({
+        sql: `SELECT * FROM pr_auto_merge_config WHERE repo_owner = ? AND repo_name = ? AND pr_number = ?`,
+        args: [repoOwner, repoName, prNumber]
+    });
+    if (rs.rows.length === 0) return null;
+    return rs.rows[0] as unknown as PRAutoMergeConfig;
+}
+
+/**
+ * Set auto-merge configuration for a specific PR
+ */
+export async function setPRAutoMergeConfig(
+    repoOwner: string,
+    repoName: string,
+    prNumber: number,
+    enabled: boolean,
+    mergeMethod: 'merge' | 'squash' | 'rebase' = 'merge'
+): Promise<void> {
+    await getDb().execute({
+        sql: `INSERT OR REPLACE INTO pr_auto_merge_config 
+              (repo_owner, repo_name, pr_number, enabled, merge_method, updated_at)
+              VALUES (?, ?, ?, ?, ?, datetime('now'))`,
+        args: [repoOwner, repoName, prNumber, enabled ? 1 : 0, mergeMethod]
+    });
+}
+
+/**
+ * Delete PR-specific auto-merge configuration
+ */
+export async function deletePRAutoMergeConfig(
+    repoOwner: string,
+    repoName: string,
+    prNumber: number
+): Promise<void> {
+    await getDb().execute({
+        sql: `DELETE FROM pr_auto_merge_config WHERE repo_owner = ? AND repo_name = ? AND pr_number = ?`,
+        args: [repoOwner, repoName, prNumber]
+    });
 }

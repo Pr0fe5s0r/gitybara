@@ -9,7 +9,7 @@ import { GlobalConfig, RepoConfig } from "../cli/config-store.js";
 import { createGitHubClient } from "../github/client.js";
 import { listOpenIssues } from "../github/issues.js";
 import { createBranch, issueToBranchName } from "../github/branches.js";
-import { openPR, listOpenPRs, getPR } from "../github/prs.js";
+import { openPR, listOpenPRs, getPR, enableAutoMerge, mergePullRequest, isAutoMergeEnabled } from "../github/prs.js";
 import { commentOnIssue, labelIssue, ensureModelLabels, getIssueComments } from "../github/issues.js";
 import { runOpenCode, encodeWorkspacePath } from "../opencode/runner.js";
 import { getAvailableModels } from "../opencode/models.js";
@@ -19,7 +19,10 @@ import {
     createJob,
     updateJob,
     getJobByIssue,
-    cancelJob
+    cancelJob,
+    getRepoAutoMergeConfig,
+    getPRAutoMergeConfig,
+    RepoAutoMergeConfig
 } from "../db/index.js";
 import { createLogger } from "../utils/logger.js";
 import { registerTask, unregisterTask, cancelTask } from "../tasks/manager.js";
@@ -574,14 +577,69 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
     // Process actionable comments on issues with existing PRs
     await processIssueComments(octokit, owner, repo, clonePath, config, limit);
 
-    // Process PRs for conflicts
+    // Process PRs for conflicts and auto-merge
     const prPromises = candidatePRs.map(pr => limit(async () => {
         // Detailed check for merge state
         const fullPR = await getPR(octokit, owner, repo, pr.number);
 
-        // mergeable_state: 'dirty' means conflicts
-        // mergeable: false means conflicts
-        if (fullPR.mergeable_state === "dirty" || fullPR.mergeable === false) {
+        // Get auto-merge configuration
+        const repoAutoMergeConfig = await getRepoAutoMergeConfig(repoId);
+        const prAutoMergeConfig = await getPRAutoMergeConfig(owner, repo, pr.number);
+        
+        // Determine effective configuration (PR config overrides repo config)
+        const autoMergeEnabled = prAutoMergeConfig?.enabled ?? repoAutoMergeConfig?.enabled ?? true;
+        const autoMergeClean = prAutoMergeConfig?.enabled !== undefined 
+            ? prAutoMergeConfig.enabled 
+            : (repoAutoMergeConfig?.auto_merge_clean ?? true);
+        const autoResolveConflicts = repoAutoMergeConfig?.auto_resolve_conflicts ?? true;
+        const mergeMethod = (prAutoMergeConfig?.merge_method ?? repoAutoMergeConfig?.merge_method ?? 'merge') as 'merge' | 'squash' | 'rebase';
+
+        // Smart conflict detection and auto-merge logic
+        const hasConflicts = fullPR.mergeable_state === "dirty" || fullPR.mergeable === false;
+        const isMergeable = fullPR.mergeable === true && !hasConflicts;
+
+        // Handle mergeable PRs with auto-merge
+        if (isMergeable && autoMergeEnabled && autoMergeClean) {
+            log.info({ pr: pr.number }, "📥 PR is mergeable, attempting auto-merge…");
+            
+            const autoMergeResult = await enableAutoMerge(
+                octokit, owner, repo, pr.number, 
+                mergeMethod.toUpperCase() as 'MERGE' | 'SQUASH' | 'REBASE'
+            );
+            
+            if (autoMergeResult.success) {
+                log.info({ pr: pr.number }, `✅ Auto-merge enabled for PR: ${autoMergeResult.message}`);
+                await commentOnIssue(
+                    octokit, owner, repo, pr.number, 
+                    `🦫 **Gitybara** has enabled auto-merge for this PR using the **${mergeMethod}** method. The PR will be merged automatically when all checks pass.`
+                ).catch(() => { });
+            } else {
+                log.warn({ pr: pr.number }, `⚠️ Could not enable auto-merge: ${autoMergeResult.message}`);
+                
+                // Try direct merge if auto-merge is not available
+                if (autoMergeResult.message.includes('not enabled for this repository')) {
+                    const directMerge = await mergePullRequest(
+                        octokit, owner, repo, pr.number, mergeMethod,
+                        `🦫 Auto-merge: ${fullPR.title}`,
+                        `This PR was automatically merged by Gitybara when it became mergeable.`
+                    );
+                    
+                    if (directMerge.success) {
+                        log.info({ pr: pr.number }, `✅ Directly merged PR: ${directMerge.message}`);
+                        await commentOnIssue(
+                            octokit, owner, repo, pr.number,
+                            `🦫 **Gitybara** has automatically merged this PR using the **${mergeMethod}** method.`
+                        ).catch(() => { });
+                    } else {
+                        log.warn({ pr: pr.number }, `⚠️ Could not merge: ${directMerge.message}`);
+                    }
+                }
+            }
+            return; // Skip to next PR after handling mergeable state
+        }
+
+        // Handle conflicting PRs with auto-resolution
+        if (hasConflicts && autoResolveConflicts) {
             log.info({ pr: pr.number }, "🔍 Conflict detected on Pull Request, attempting auto-fix…");
 
             const branchName = fullPR.head.ref;
@@ -603,6 +661,8 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
 
                 // Attempt to merge base branch (e.g. main)
                 log.info({ pr: pr.number, base: fullPR.base.ref }, "Merging base branch into PR branch…");
+                let resolvedByAI = false;
+                
                 try {
                     await sharedGit.fetch(["origin", fullPR.base.ref]);
                     await execa("git", ["merge", `origin/${fullPR.base.ref}`], { cwd: workDir });
@@ -625,6 +685,8 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                     if (!result.success) {
                         throw new Error(`OpenCode failed to resolve conflicts: ${result.summary}`);
                     }
+                    
+                    resolvedByAI = true;
                     log.info({ pr: pr.number }, "✅ OpenCode resolved conflicts.");
                 }
 
@@ -632,11 +694,35 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 await git.add(".");
                 const status = await git.status();
                 if (status.staged.length > 0) {
-                    await git.commit(`🦫 Gitybara: Auto-resolved merge conflicts with ${fullPR.base.ref}`);
+                    const commitMsg = resolvedByAI 
+                        ? `🦫 Gitybara: Auto-resolved merge conflicts with ${fullPR.base.ref} using AI`
+                        : `🦫 Gitybara: Auto-merged ${fullPR.base.ref} (no conflicts)`;
+                    
+                    await git.commit(commitMsg);
                     const remoteWithToken = `https://x-access-token:${config.githubToken}@github.com/${owner}/${repo}.git`;
                     await git.push(["-f", remoteWithToken, `HEAD:${branchName}`]);
 
-                    await commentOnIssue(octokit, owner, repo, pr.number, "🦫 **Gitybara** has automatically detected and resolved merge conflicts in this PR!");
+                    await commentOnIssue(
+                        octokit, owner, repo, pr.number, 
+                        `🦫 **Gitybara** has automatically detected and resolved merge conflicts in this PR!${resolvedByAI ? ' Conflicts were resolved using AI.' : ''}`
+                    );
+                    
+                    // Check if we should enable auto-merge after conflict resolution
+                    if (autoMergeEnabled) {
+                        log.info({ pr: pr.number }, "Attempting to enable auto-merge after conflict resolution…");
+                        const autoMergeResult = await enableAutoMerge(
+                            octokit, owner, repo, pr.number,
+                            mergeMethod.toUpperCase() as 'MERGE' | 'SQUASH' | 'REBASE'
+                        );
+                        
+                        if (autoMergeResult.success) {
+                            log.info({ pr: pr.number }, `✅ Auto-merge enabled after conflict resolution`);
+                            await commentOnIssue(
+                                octokit, owner, repo, pr.number,
+                                `🦫 Auto-merge has been enabled. The PR will merge automatically when all checks pass.`
+                            ).catch(() => { });
+                        }
+                    }
                 } else {
                     log.info({ pr: pr.number }, "No changes to commit after conflict resolution check.");
                 }
@@ -649,6 +735,8 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
 
                 // No automatic cleanup on error
             }
+        } else if (hasConflicts && !autoResolveConflicts) {
+            log.info({ pr: pr.number }, "⏸️ Conflicts detected but auto-resolution is disabled for this repository.");
         } else {
             log.debug({ pr: pr.number }, "Pull Request is mergeable, no action needed.");
         }
