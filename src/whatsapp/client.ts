@@ -134,8 +134,8 @@ export async function startWhatsappDaemon(
 
     client.on("message_create", async (msg) => {
         // Normalize comparison for owner verification
-        const isFromOwner = msg.from === ownerId;
-        if (!isFromOwner) return;
+        const remoteJid = msg.fromMe ? msg.to : msg.from;
+        if (remoteJid !== ownerId) return;
 
         const text = msg.body.trim();
         if (!text) return;
