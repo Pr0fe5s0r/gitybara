@@ -4,9 +4,7 @@ import fs from "fs";
 import pLimit from "p-limit";
 import { v4 as uuidv4 } from "uuid";
 import { execa } from "execa";
-// @ts-ignore
-import rimraf from "rimraf";
-const rimrafSync = (rimraf as any).rimrafSync || rimraf;
+import { rimrafSync } from "rimraf";
 import { GlobalConfig, RepoConfig } from "../cli/config-store.js";
 import { createGitHubClient } from "../github/client.js";
 import { listOpenIssues } from "../github/issues.js";
