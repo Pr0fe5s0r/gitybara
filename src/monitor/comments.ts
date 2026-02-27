@@ -1,10 +1,10 @@
 import { Octokit } from "@octokit/rest";
 import { PRComment, getPRComments, commentOnPR } from "../github/prs.js";
 import { getIssueComments, commentOnIssue } from "../github/issues.js";
-import { 
-    isCommentProcessed, 
-    markCommentProcessed, 
-    getLastProcessedCommentTime 
+import {
+    isCommentProcessed,
+    markCommentProcessed,
+    getLastProcessedCommentTime
 } from "../db/index.js";
 import { createLogger } from "../utils/logger.js";
 
@@ -36,12 +36,12 @@ const DEFAULT_KEYWORDS = [
  * Detect if a comment contains actionable feedback
  */
 export function analyzeComment(
-    comment: PRComment, 
+    comment: PRComment,
     config: CommentMonitorConfig
 ): ActionableComment {
     const body = comment.body.toLowerCase();
     const keywords = config.actionableKeywords || DEFAULT_KEYWORDS;
-    
+
     // Skip bot comments if configured
     if (config.skipBotComments && comment.user.type === 'Bot') {
         return {
@@ -51,7 +51,7 @@ export function analyzeComment(
             extractedRequest: ''
         };
     }
-    
+
     // Skip Gitybara's own comments
     if (comment.user.login === 'gitybara' || comment.body.includes('🦫 **Gitybara**')) {
         return {
@@ -61,12 +61,12 @@ export function analyzeComment(
             extractedRequest: ''
         };
     }
-    
+
     // Check for explicit fix requests
     let actionType: 'fix' | 'feedback' | 'clarification' | 'ignore' = 'ignore';
     let confidence = 0;
     let extractedRequest = '';
-    
+
     // Look for fix keywords
     for (const keyword of keywords) {
         if (body.includes(keyword.toLowerCase())) {
@@ -74,7 +74,7 @@ export function analyzeComment(
             actionType = 'fix';
         }
     }
-    
+
     // Check for code blocks (suggested changes)
     if (body.includes('```') || body.includes('`')) {
         confidence += 0.2;
@@ -82,28 +82,28 @@ export function analyzeComment(
             extractedRequest = extractCodeChanges(comment.body);
         }
     }
-    
+
     // Check for specific patterns
     if (body.includes('nit:') || body.includes('nitpick:')) {
         confidence += 0.2;
         actionType = 'fix';
     }
-    
+
     // Only mark as clarification if no fix action was detected and comment contains a question
     if (body.includes('?') && actionType === 'ignore') {
         actionType = 'clarification';
         confidence += 0.4;
     }
-    
+
     // Cap confidence at 1.0
     confidence = Math.min(confidence, 1.0);
-    
+
     // If no specific patterns found but comment is substantial, mark as feedback
     if (actionType === 'ignore' && comment.body.length > 50) {
         actionType = 'feedback';
         confidence = 0.3;
     }
-    
+
     return {
         comment,
         actionType,
@@ -117,23 +117,23 @@ export function analyzeComment(
  */
 function extractCodeChanges(body: string): string {
     const changes: string[] = [];
-    
+
     // Extract code blocks
     const codeBlockRegex = /```[\s\S]*?```/g;
     const matches = body.match(codeBlockRegex);
-    
+
     if (matches) {
         changes.push(...matches);
     }
-    
+
     // Extract inline code
     const inlineCodeRegex = /`[^`]+`/g;
     const inlineMatches = body.match(inlineCodeRegex);
-    
+
     if (inlineMatches) {
         changes.push(...inlineMatches);
     }
-    
+
     return changes.join('\n\n');
 }
 
@@ -147,27 +147,20 @@ export async function getUnprocessedComments(
     issueNumber: number,
     isPR: boolean = false
 ): Promise<PRComment[]> {
-    const comments = isPR 
+    const comments = isPR
         ? await getPRComments(octokit, owner, repo, issueNumber)
-        : (await getIssueComments(octokit, owner, repo, issueNumber)).map((body, index) => ({
-            id: index, // Issue comments don't have IDs in current implementation
-            body,
-            user: { login: 'unknown', type: 'User' },
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            html_url: ''
-        }));
-    
+        : await getIssueComments(octokit, owner, repo, issueNumber);
+
     // Filter out already processed comments
     const unprocessed: PRComment[] = [];
-    
+
     for (const comment of comments) {
         const processed = await isCommentProcessed(owner, repo, comment.id);
         if (!processed) {
             unprocessed.push(comment);
         }
     }
-    
+
     return unprocessed;
 }
 
@@ -185,30 +178,30 @@ export async function findActionableComments(
     if (!config.enabled) {
         return [];
     }
-    
+
     const comments = await getUnprocessedComments(octokit, owner, repo, issueNumber, isPR);
     const actionable: ActionableComment[] = [];
-    
+
     for (const comment of comments) {
         const analysis = analyzeComment(comment, config);
-        
+
         // Only consider comments with sufficient confidence
         if (analysis.actionType !== 'ignore' && analysis.confidence >= 0.3) {
             actionable.push(analysis);
         }
-        
+
         // Mark as processed regardless of actionability (to avoid re-processing)
         await markCommentProcessed(owner, repo, issueNumber, comment.id, comment.body, analysis.actionType);
     }
-    
-    log.info({ 
-        owner, 
-        repo, 
-        issue: issueNumber, 
-        total: comments.length, 
-        actionable: actionable.length 
+
+    log.info({
+        owner,
+        repo,
+        issue: issueNumber,
+        total: comments.length,
+        actionable: actionable.length
     }, `Analyzed ${comments.length} comments, found ${actionable.length} actionable`);
-    
+
     return actionable;
 }
 
@@ -237,11 +230,11 @@ Body: ${originalIssueBody || 'No description provided'}
    From: @${ac.comment.user.login}
    Content: ${ac.comment.body}
 `;
-        
+
         if (ac.extractedRequest) {
             prompt += `   Suggested Changes:\n${ac.extractedRequest}\n`;
         }
-        
+
         prompt += '\n';
     }
 

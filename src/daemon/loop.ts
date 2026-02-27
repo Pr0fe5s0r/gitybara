@@ -177,14 +177,50 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
         const existingJob = await getJobByIssue(owner, repo, issue.number);
         const comments = await getIssueComments(octokit, owner, repo, issue.number);
 
+        const jobId = existingJob ? existingJob.id : await createJob(repoId, owner, repo, issue.number, issue.title);
+
         if (existingJob) {
-            if (existingJob.status === "done" || existingJob.status === "in-progress") {
-                log.debug({ issue: issue.number }, "Already processed or in-progress, skipping");
-                return;
+            if (existingJob.status === "done") {
+                // If the user removed the 'done' label, they want us to try again.
+                if (!issue.labels.includes("gitybara:done")) {
+                    log.info({ issue: issue.number }, "Label 'gitybara:done' removed, re-evaluating issue.");
+                    await updateJob(jobId, "pending", existingJob.branch || "");
+                } else {
+                    // Still marked as done. Check for actionable comments.
+                    const commentConfig: CommentMonitorConfig = {
+                        enabled: true,
+                        autoApplyFixes: true,
+                        skipBotComments: true,
+                        actionableKeywords: [
+                            'fix', 'change', 'update', 'modify', 'correct', 'improve',
+                            'please fix', 'can you fix', 'need to fix', 'should fix',
+                            'change request', 'requested changes', 'please address',
+                            'update the', 'modify the', 'fix the', 'correct the'
+                        ]
+                    };
+
+                    const actionable = await findActionableComments(octokit, owner, repo, issue.number, false, commentConfig);
+                    if (actionable.length > 0) {
+                        log.info({ issue: issue.number }, "Found new actionable comments on 'done' issue, re-opening.");
+                        await updateJob(jobId, "pending", existingJob.branch || "");
+                    } else {
+                        log.debug({ issue: issue.number }, "Issue is already marked as 'done', skipping.");
+                        return;
+                    }
+                }
+            } else if (existingJob.status === "in-progress") {
+                // Check if it's actually running in this process
+                const { getRunningTask } = await import("../tasks/manager.js");
+                if (getRunningTask(jobId)) {
+                    log.debug({ issue: issue.number }, "Already in-progress in this runner, skipping");
+                    return;
+                }
+                log.info({ issue: issue.number }, "Found stale in-progress job, resetting to allow resumption");
+                await updateJob(jobId, "pending", existingJob.branch || "");
             }
             if (existingJob.status === "waiting") {
                 // If the last comment starts with Gitybara, the user hasn't replied yet
-                if (comments.length > 0 && comments[comments.length - 1].includes("🦫 **Gitybara** needs clarification:")) {
+                if (comments.length > 0 && comments[comments.length - 1].body.includes("🦫 **Gitybara** needs clarification:")) {
                     log.debug({ issue: issue.number }, "Still waiting for user clarification, skipping");
                     return;
                 }
@@ -272,7 +308,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             }
         }
 
-        const jobId = existingJob ? existingJob.id : await createJob(repoId, owner, repo, issue.number, issue.title);
+        // jobId is already defined above
 
         // Create abort controller for this task
         const abortController = new AbortController();
@@ -340,11 +376,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
 
             // Ensure old worktree from previous crash doesn't exist
             if (fs.existsSync(workDir)) {
-                try {
-                    await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
-                } catch {
-                    rimrafSync(workDir, { maxRetries: 3, retryDelay: 500 });
-                }
+                await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
                 await execa("git", ["worktree", "prune"], { cwd: clonePath }).catch(() => { });
             }
 
@@ -652,7 +684,6 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                     // Ensure workdir is clean
                     if (fs.existsSync(workDir)) {
                         await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
-                        rimrafSync(workDir, { maxRetries: 3 });
                     }
 
                     // Prepare worktree
@@ -742,10 +773,9 @@ async function processIssueComments(
     const db = getDb();
 
     const rs = await db.execute({
-        sql: `SELECT issue_number FROM jobs 
+        sql: `SELECT issue_number, pr_url FROM jobs 
                WHERE repo_owner = ? AND repo_name = ? 
-               AND status = 'done' 
-               AND pr_url IS NOT NULL`,
+               AND status = 'done'`,
         args: [owner, repo]
     });
 
@@ -753,25 +783,33 @@ async function processIssueComments(
         return;
     }
 
-    const issuesWithPRs = rs.rows.map((r: any) => r.issue_number as number);
-    log.info({ issues: issuesWithPRs.length }, `Checking ${issuesWithPRs.length} issues with PRs for actionable comments`);
+    const issuesWithDoneJobs = rs.rows.map((r: any) => ({
+        number: r.issue_number as number,
+        prUrl: r.pr_url as string | null
+    }));
+    log.info({ count: issuesWithDoneJobs.length }, `Checking ${issuesWithDoneJobs.length} 'done' jobs for actionable comments`);
 
-    for (const issueNumber of issuesWithPRs) {
+    for (const item of issuesWithDoneJobs) {
+        const issueNumber = item.number;
         try {
-            // Find the associated PR
-            const { data: prs } = await octokit.rest.pulls.list({
-                owner,
-                repo,
-                state: "open"
-            });
+            // If it has a PR, find it
+            let associatedPR: any = null;
+            if (item.prUrl) {
+                const { data: prs } = await octokit.rest.pulls.list({
+                    owner,
+                    repo,
+                    state: "open"
+                });
 
-            // Find PR that mentions this issue
-            const associatedPR = prs.find((pr: any) =>
-                pr.body?.includes(`#${issueNumber}`) ||
-                pr.title?.includes(`#${issueNumber}`)
-            );
+                associatedPR = prs.find((pr: any) =>
+                    pr.html_url === item.prUrl ||
+                    pr.body?.includes(`#${issueNumber}`) ||
+                    pr.title?.includes(`#${issueNumber}`)
+                );
+            }
 
-            if (!associatedPR) {
+            if (!associatedPR && item.prUrl) {
+                // PR existed once but now gone?
                 continue;
             }
 
@@ -796,8 +834,23 @@ async function processIssueComments(
                 continue;
             }
 
-            log.info({ issue: issueNumber, pr: associatedPR.number, comments: actionableComments.length },
-                `💬 Found ${actionableComments.length} actionable comments on issue #${issueNumber}`);
+            if (associatedPR) {
+                log.info({ issue: issueNumber, pr: associatedPR.number, comments: actionableComments.length },
+                    `💬 Found ${actionableComments.length} actionable comments on issue #${issueNumber} with PR #${associatedPR.number}`);
+            } else {
+                log.info({ issue: issueNumber, comments: actionableComments.length },
+                    `💬 Found ${actionableComments.length} actionable comments on issue #${issueNumber} (no PR yet).`);
+
+                // If no PR yet, we should just reset the job to 'pending'
+                // This will cause the main loop to pick it up and run a full cycle
+                const jobId = (await getJobByIssue(owner, repo, issueNumber))?.id;
+                if (jobId) {
+                    await updateJob(jobId, "pending", "");
+                    await labelIssue(octokit, owner, repo, issueNumber, "gitybara:in-progress").catch(() => { });
+                    await commentOnIssue(octokit, owner, repo, issueNumber, `🦫 **Gitybara** is re-opening this issue based on your feedback!`).catch(() => { });
+                }
+                continue;
+            }
 
             // Process the comments similar to PR comments
             const branchName = associatedPR.head.ref;
@@ -809,7 +862,6 @@ async function processIssueComments(
                 // Ensure workdir is clean
                 if (fs.existsSync(workDir)) {
                     await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
-                    rimrafSync(workDir, { maxRetries: 3 });
                 }
 
                 // Prepare worktree

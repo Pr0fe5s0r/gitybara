@@ -102,7 +102,7 @@ export async function cancelJob(
  */
 export async function getActiveJobs(): Promise<JobRecord[]> {
     const rs = await getDb().execute({
-        sql: `SELECT id, status, updated_at, force_new_branch FROM jobs
+        sql: `SELECT id, status, updated_at, force_new_branch, branch, pr_url FROM jobs
        WHERE status IN ('pending', 'in-progress')
        ORDER BY created_at ASC`,
         args: []
@@ -182,6 +182,8 @@ export type JobRecord = {
     status: string;
     updated_at: string;
     force_new_branch: number;
+    branch: string | null;
+    pr_url: string | null;
 };
 
 export async function getJobByIssue(
@@ -190,7 +192,7 @@ export async function getJobByIssue(
     issueNumber: number
 ): Promise<JobRecord | null> {
     const rs = await getDb().execute({
-        sql: `SELECT id, status, updated_at, force_new_branch FROM jobs
+        sql: `SELECT id, status, updated_at, force_new_branch, branch, pr_url FROM jobs
        WHERE repo_owner = ? AND repo_name = ? AND issue_number = ?
        ORDER BY updated_at DESC LIMIT 1`,
         args: [repoOwner, repoName, issueNumber]
@@ -241,7 +243,7 @@ export async function markCommentProcessed(
     // Create a hash of the comment body to detect edits
     const crypto = await import('crypto');
     const commentHash = crypto.createHash('sha256').update(commentBody).digest('hex');
-    
+
     await getDb().execute({
         sql: `INSERT OR REPLACE INTO processed_comments 
        (repo_owner, repo_name, issue_number, comment_id, comment_body, comment_hash, status, processed_at)
