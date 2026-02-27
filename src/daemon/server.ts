@@ -3,6 +3,7 @@ import { getDb, resetStaleJobs } from "../db/index.js";
 import { readConfig } from "../cli/config-store.js";
 import { createLogger } from "../utils/logger.js";
 import crypto from "crypto";
+import { getTaskStats, cancelTask, cancelAllTasks } from "../tasks/manager.js";
 
 const log = createLogger("daemon-server");
 
@@ -97,6 +98,48 @@ export function startServer(port: number) {
         }
 
         res.json({ ok: true });
+    });
+
+    // ── GET /tasks ───────────────────────────────────────────────────────
+    // List all currently running tasks
+    app.get("/tasks", (_req, res) => {
+        const stats = getTaskStats();
+        res.json({
+            running: stats.running,
+            tasks: stats.tasks
+        });
+    });
+
+    // ── POST /tasks/:jobId/cancel ────────────────────────────────────────
+    // Cancel a specific running task
+    app.post("/tasks/:jobId/cancel", async (req, res) => {
+        const jobId = parseInt(req.params.jobId, 10);
+        if (isNaN(jobId)) {
+            res.status(400).json({ error: "Invalid job ID" });
+            return;
+        }
+
+        const force = req.query.force === "true";
+        const result = await cancelTask(jobId, force);
+        
+        if (result.success) {
+            res.json({ success: true, message: result.message });
+        } else {
+            res.status(404).json({ success: false, error: result.message });
+        }
+    });
+
+    // ── POST /tasks/cancel-all ───────────────────────────────────────────
+    // Cancel all running tasks
+    app.post("/tasks/cancel-all", async (req, res) => {
+        const force = req.query.force === "true";
+        const result = await cancelAllTasks(force);
+        res.json({
+            success: result.success,
+            cancelled: result.cancelled,
+            failed: result.failed,
+            messages: result.messages
+        });
     });
 
     app.listen(port, "127.0.0.1", () => {

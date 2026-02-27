@@ -4,6 +4,7 @@ import { initCommand } from "./init.js";
 import { startCommand } from "./start.js";
 import { stopCommand } from "./stop.js";
 import { statusCommand } from "./status.js";
+import { cancelCommand, listJobsCommand } from "./cancel.js";
 import { configCommand, configModelCommand } from "./config.js";
 import { learnCommand } from "./learn.js";
 import { addRepoCommand, removeRepoCommand } from "./repo-management.js";
@@ -46,6 +47,28 @@ program
     .description("Show daemon status and recent jobs")
     .option("-j, --json", "Output as JSON")
     .action(statusCommand);
+
+program
+    .command("cancel")
+    .description("List and cancel running tasks")
+    .argument("[action]", "Action: list, stop")
+    .argument("[target]", "Target: job-id or 'all'")
+    .option("-f, --force", "Force cancel (kill immediately)")
+    .action(cancelCommand);
+
+program
+    .command("jobs")
+    .description("List all jobs with their status")
+    .option("-s, --status <status>", "Filter by status (pending, in-progress, done, failed, cancelled)")
+    .option("-l, --limit <number>", "Limit number of results", "20")
+    .option("-j, --json", "Output as JSON")
+    .action(async (options) => {
+        await listJobsCommand({
+            status: options.status,
+            limit: parseInt(options.limit, 10),
+            json: options.json
+        });
+    });
 
 const configCmd = program
     .command("config")

@@ -63,6 +63,38 @@ export async function initDb(): Promise<void> {
     }
 }
 
+/**
+ * Cancel a job by ID - updates status to cancelled
+ */
+export async function cancelJob(
+    id: number,
+    reason?: string
+): Promise<boolean> {
+    try {
+        await getDb().execute({
+            sql: `UPDATE jobs SET status = 'cancelled', error = ?, updated_at = datetime('now')
+           WHERE id = ? AND status IN ('pending', 'in-progress')`,
+            args: [reason || 'Cancelled by user', id]
+        });
+        return true;
+    } catch (e: any) {
+        return false;
+    }
+}
+
+/**
+ * Get pending and in-progress jobs
+ */
+export async function getActiveJobs(): Promise<JobRecord[]> {
+    const rs = await getDb().execute({
+        sql: `SELECT id, status, updated_at, force_new_branch FROM jobs
+       WHERE status IN ('pending', 'in-progress')
+       ORDER BY created_at ASC`,
+        args: []
+    });
+    return rs.rows as unknown as JobRecord[];
+}
+
 export async function upsertRepo(owner: string, name: string): Promise<number> {
     const db = getDb();
     await db.execute({

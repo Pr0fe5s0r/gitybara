@@ -4,6 +4,7 @@ import ora from "ora";
 import { createLogger } from "../utils/logger.js";
 import { analyzeBridgeMessage, planGithubIssue } from "../opencode/runner.js";
 import { createGitHubClient } from "../github/client.js";
+import { cancelTask, getRunningTasks } from "../tasks/manager.js";
 
 const logger = createLogger("telegram-client");
 
@@ -74,6 +75,47 @@ export async function startTelegramDaemon(
             }
 
             const state = states.get(ownerId) || { step: "IDLE" };
+
+            // Handle stop/cancel commands
+            const lowerText = text.toLowerCase();
+            if (lowerText === "/stop" || lowerText === "/cancel" || lowerText === "stop" || lowerText === "cancel") {
+                const tasks = getRunningTasks();
+                if (tasks.length === 0) {
+                    await sendTagged(bot, ownerId, "🦫 No tasks are currently running.");
+                    return;
+                }
+                
+                // Cancel the most recently started task
+                const mostRecentTask = tasks[tasks.length - 1];
+                await sendTagged(bot, ownerId, `🛑 Cancelling task for Issue #${mostRecentTask.issueNumber} in ${mostRecentTask.repoOwner}/${mostRecentTask.repoName}...`);
+                
+                const result = await cancelTask(mostRecentTask.jobId);
+                if (result.success) {
+                    await sendTagged(bot, ownerId, `✅ Task cancelled successfully!`);
+                } else {
+                    await sendTagged(bot, ownerId, `❌ Failed to cancel: ${result.message}`);
+                }
+                return;
+            }
+
+            // Handle /tasks command to list running tasks
+            if (lowerText === "/tasks" || lowerText === "/status") {
+                const tasks = getRunningTasks();
+                if (tasks.length === 0) {
+                    await sendTagged(bot, ownerId, "🦫 No tasks are currently running.");
+                } else {
+                    let message = `🦫 <b>Running Tasks (${tasks.length}):</b>\n\n`;
+                    tasks.forEach((task, i) => {
+                        const duration = Math.floor((Date.now() - task.startedAt.getTime()) / 1000 / 60);
+                        message += `${i + 1}. Issue #${task.issueNumber} in ${task.repoOwner}/${task.repoName}\n`;
+                        message += `   Branch: ${task.branchName}\n`;
+                        message += `   Duration: ${duration}m\n\n`;
+                    });
+                    message += `Send /stop to cancel the most recent task.`;
+                    await bot.sendMessage(ownerId, message, { parse_mode: "HTML" });
+                }
+                return;
+            }
 
             if (state.step === "IDLE") {
                 logger.info({ text: text.substring(0, 50) + "..." }, "Processing new message from Telegram owner...");

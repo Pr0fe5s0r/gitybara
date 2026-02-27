@@ -18,9 +18,11 @@ import {
     upsertRepo,
     createJob,
     updateJob,
-    getJobByIssue
+    getJobByIssue,
+    cancelJob
 } from "../db/index.js";
 import { createLogger } from "../utils/logger.js";
+import { registerTask, unregisterTask, cancelTask } from "../tasks/manager.js";
 
 const log = createLogger("daemon-loop");
 
@@ -231,6 +233,22 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
 
         const jobId = existingJob ? existingJob.id : await createJob(repoId, owner, repo, issue.number, issue.title);
 
+        // Create abort controller for this task
+        const abortController = new AbortController();
+
+        // Register the task for potential cancellation
+        registerTask({
+            jobId,
+            issueNumber: issue.number,
+            repoOwner: owner,
+            repoName: repo,
+            branchName: finalBranchName,
+            workDir: "", // Will be set later
+            clonePath,
+            abortController,
+            startedAt: new Date()
+        });
+
         let selectedProvider = config.defaultProvider;
         let selectedModel = config.defaultModel;
 
@@ -250,7 +268,19 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
         const safeBranchName = finalBranchName.replace(/[^\w.-]/g, "-");
         const workDir = path.join(path.dirname(clonePath), safeBranchName);
 
+        // Update the registered task with workDir
+        const { getRunningTask } = await import("../tasks/manager.js");
+        const task = getRunningTask(jobId);
+        if (task) {
+            task.workDir = workDir;
+        }
+
         try {
+            // Check if task was cancelled before we start
+            if (abortController.signal.aborted) {
+                throw new Error("Task was cancelled by user");
+            }
+
             // 1. Label issue as in-progress
             await updateJob(jobId, "in-progress", finalBranchName);
             await labelIssue(octokit, owner, repo, issue.number, "gitybara:in-progress").catch(() => { });
@@ -297,6 +327,11 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 owner, repo, issue.number, issue.title,
                 issue.body || "", rules, comments
             );
+
+            // Check for cancellation before running OpenCode
+            if (abortController.signal.aborted) {
+                throw new Error("Task was cancelled by user");
+            }
 
             // 5. Run OpenCode
             log.info({ issue: issue.number }, "Running OpenCode (this may take a few minutes)…");
@@ -392,12 +427,24 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             log.info({ issue: issue.number, pr: pr.url }, "✅ Issue resolved — PR opened");
         } catch (err) {
             const errMsg = String(err);
-            await updateJob(jobId, "failed", branchName, undefined, errMsg);
-            log.error({ err, issue: issue.number }, "❌ Failed to process issue");
-            await commentOnIssue(
-                octokit, owner, repo, issue.number,
-                `🦫 **Gitybara** encountered an error:\n\`\`\`\n${errMsg}\n\`\`\`\n\nPlease check the logs or re-open the issue.`
-            ).catch(() => { });
+            
+            // Check if this was a cancellation
+            if (errMsg.includes("cancelled") || abortController.signal.aborted) {
+                log.info({ issue: issue.number }, "🛑 Task was cancelled");
+                await updateJob(jobId, "cancelled", branchName, undefined, "Cancelled by user");
+                await labelIssue(octokit, owner, repo, issue.number, "gitybara:cancelled").catch(() => { });
+                await commentOnIssue(
+                    octokit, owner, repo, issue.number,
+                    `🦫 **Gitybara** stopped!\n\nThis task has been cancelled as requested.`
+                ).catch(() => { });
+            } else {
+                await updateJob(jobId, "failed", branchName, undefined, errMsg);
+                log.error({ err, issue: issue.number }, "❌ Failed to process issue");
+                await commentOnIssue(
+                    octokit, owner, repo, issue.number,
+                    `🦫 **Gitybara** encountered an error:\n\`\`\`\n${errMsg}\n\`\`\`\n\nPlease check the logs or re-open the issue.`
+                ).catch(() => { });
+            }
 
             // Ensure cleanup even on error
             if (typeof workDir !== 'undefined' && fs.existsSync(workDir)) {
@@ -410,6 +457,9 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                     } catch (e) { }
                 }
             }
+        } finally {
+            // Always unregister the task when done
+            unregisterTask(jobId);
         }
     }));
 
