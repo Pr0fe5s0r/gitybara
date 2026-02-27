@@ -9,7 +9,7 @@ const log = createLogger("opencode-runner");
  * Encode a workspace path to base64 format for URL-safe identification
  */
 export function encodeWorkspacePath(workingDir: string): string {
-    return Buffer.from(workingDir.replace(/\\/g, "/")).toString("base64").replace(/=/g, "");
+    return Buffer.from(workingDir).toString("base64").replace(/=/g, "");
 }
 
 async function getAvailablePort(): Promise<number> {
