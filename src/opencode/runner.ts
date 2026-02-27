@@ -5,6 +5,13 @@ import * as net from "net";
 
 const log = createLogger("opencode-runner");
 
+/**
+ * Encode a workspace path to base64 format for URL-safe identification
+ */
+export function encodeWorkspacePath(workingDir: string): string {
+    return Buffer.from(workingDir.replace(/\\/g, "/")).toString("base64").replace(/=/g, "");
+}
+
 async function getAvailablePort(): Promise<number> {
     return new Promise((resolve, reject) => {
         const srv = net.createServer();
@@ -115,8 +122,7 @@ export async function runOpenCode(
 
         if (!sessionRes.data?.id) throw new Error("No session ID returned");
         sessionId = sessionRes.data.id;
-        const normalizedPath = workingDir.replace(/\\/g, "/");
-        const encodedPath = Buffer.from(normalizedPath).toString("base64").replace(/=/g, "");
+        const encodedPath = encodeWorkspacePath(workingDir);
         const fullSessionUrl = `${sessionUrl}/${encodedPath}/session/${sessionId}`;
         log.info({ sessionId, sessionUrl: fullSessionUrl }, "OpenCode session created");
 
@@ -163,7 +169,7 @@ export async function runOpenCode(
         summary,
         filesChanged,
         rawOutput,
-        sessionUrl: (freePort && sessionId) ? `http://localhost:${freePort}/${Buffer.from(workingDir.replace(/\\/g, "/")).toString("base64").replace(/=/g, "")}/session/${sessionId}` : undefined
+        sessionUrl: (freePort && sessionId) ? `http://localhost:${freePort}/${encodeWorkspacePath(workingDir)}/session/${sessionId}` : undefined
     };
 }
 

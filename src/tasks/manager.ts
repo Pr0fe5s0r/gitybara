@@ -3,6 +3,7 @@ import { updateJob } from "../db/index.js";
 import { execa } from "execa";
 import { rimrafSync } from "rimraf";
 import fs from "fs";
+import { encodeWorkspacePath } from "../opencode/runner.js";
 
 const log = createLogger("task-manager");
 
@@ -121,7 +122,7 @@ export async function cancelTask(
                 try {
                     rimrafSync(task.workDir, { maxRetries: 3, retryDelay: 500 });
                 } catch (e) {
-                    log.warn({ jobId, workDir: task.workDir }, "Failed to cleanup work directory");
+                    log.warn({ jobId, workDir: encodeWorkspacePath(task.workDir) }, "Failed to cleanup work directory");
                 }
             }
         }

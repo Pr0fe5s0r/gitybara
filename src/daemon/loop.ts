@@ -11,7 +11,7 @@ import { listOpenIssues } from "../github/issues.js";
 import { createBranch, issueToBranchName } from "../github/branches.js";
 import { openPR, listOpenPRs, getPR } from "../github/prs.js";
 import { commentOnIssue, labelIssue, ensureModelLabels, getIssueComments } from "../github/issues.js";
-import { runOpenCode } from "../opencode/runner.js";
+import { runOpenCode, encodeWorkspacePath } from "../opencode/runner.js";
 import { getAvailableModels } from "../opencode/models.js";
 import { getRules, buildSystemPrompt } from "../learning/engine.js";
 import {
@@ -294,7 +294,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             );
 
             // Clone the repo straight into the isolated run path
-            log.info({ issue: issue.number, workDir }, "Preparing isolated workspace via git worktree…");
+            log.info({ issue: issue.number, workDir: encodeWorkspacePath(workDir) }, "Preparing isolated workspace via git worktree…");
             const sharedGit = simpleGit(clonePath);
 
             // Ensure old worktree from previous crash doesn't exist
@@ -417,7 +417,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             try {
                 await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
             } catch (cleanupErr) {
-                log.warn({ err: cleanupErr, workDir }, "Failed to remove worktree via git, falling back to rimraf");
+                log.warn({ err: cleanupErr, workDir: encodeWorkspacePath(workDir) }, "Failed to remove worktree via git, falling back to rimraf");
                 try {
                     await new Promise(r => setTimeout(r, 1000));
                     rimrafSync(workDir, { maxRetries: 10, retryDelay: 500 });
