@@ -300,26 +300,31 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
 
             // 5. Run OpenCode
             log.info({ issue: issue.number }, "Running OpenCode (this may take a few minutes)…");
+
+            // Determine if we should share the session URL
+            const shouldShareSession = issue.labels.includes("share:session_url");
+            let sessionUrlPosted = false;
+
             const result = await runOpenCode(
                 config.opencodePath,
                 workDir,
                 systemPrompt,
                 selectedProvider,
-                selectedModel
-            );
-
-            if (result.sessionUrl) {
-                log.info({ issue: issue.number, sessionUrl: result.sessionUrl }, "👁️ Watch live OpenCode session");
-                const shouldShare = issue.labels.includes("share:session_url");
-                if (shouldShare) {
-                    await commentOnIssue(
-                        octokit, owner, repo, issue.number,
-                        `🦫 **Gitybara** is now coding! You can watch the session live here: ${result.sessionUrl}`
-                    ).catch(() => { });
-                } else {
-                    log.info({ issue: issue.number }, "Skipping session URL comment (share:session_url label not found)");
+                selectedModel,
+                // Callback invoked immediately when session is created
+                async (sessionUrl: string) => {
+                    log.info({ issue: issue.number, sessionUrl }, "👁️ Watch live OpenCode session");
+                    if (shouldShareSession && !sessionUrlPosted) {
+                        sessionUrlPosted = true;
+                        await commentOnIssue(
+                            octokit, owner, repo, issue.number,
+                            `🦫 **Gitybara** is now coding! You can watch the session live here: ${sessionUrl}`
+                        ).catch(() => { });
+                    } else if (!shouldShareSession) {
+                        log.info({ issue: issue.number }, "Skipping session URL comment (share:session_url label not found)");
+                    }
                 }
-            }
+            );
 
             if (!result.success || result.filesChanged.length === 0) {
                 // If the agent intentionally asked for clarification, pause it.
