@@ -1,4 +1,5 @@
 import chalk from "chalk";
+import Table from "cli-table3";
 import { createGitHubClient } from "../github/client.js";
 import { enableAutoMerge, disableAutoMerge, isAutoMergeEnabled } from "../github/prs.js";
 import { 
@@ -7,7 +8,12 @@ import {
     getRepoAutoMergeConfig, 
     updateRepoAutoMergeConfig,
     setPRAutoMergeConfig,
-    deletePRAutoMergeConfig
+    deletePRAutoMergeConfig,
+    addConflictResolutionPattern,
+    deleteConflictResolutionPattern,
+    getConflictResolutionPatterns,
+    getConflictResolutionHistory,
+    getConflictResolutionStats
 } from "../db/index.js";
 import { readConfig } from "./config-store.js";
 
