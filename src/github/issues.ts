@@ -1,5 +1,6 @@
 import { Octokit } from "@octokit/rest";
 import pLimit from "p-limit";
+import { withRetry } from "../utils/retry.js";
 
 export interface GitHubIssue {
     number: number;
@@ -25,7 +26,8 @@ export async function listOpenIssues(
         params.labels = labelFilter;
     }
 
-    const { data } = await octokit.rest.issues.listForRepo(params);
+    const response = await withRetry(() => octokit.rest.issues.listForRepo(params));
+    const data = response.data;
 
     // Exclude pull requests (GitHub API returns PRs as issues)
     // and exclude those already marked as done
@@ -53,21 +55,25 @@ export async function labelIssue(
 ): Promise<void> {
     // Ensure label exists first
     try {
-        await octokit.rest.issues.getLabel({ owner, repo, name: label });
-    } catch {
-        await octokit.rest.issues.createLabel({
-            owner,
-            repo,
-            name: label,
-            color: label === "gitybara:in-progress" ? "fbca04" : "0e8a16",
-        });
+        await withRetry(() => octokit.rest.issues.getLabel({ owner, repo, name: label }));
+    } catch (err: any) {
+        if (err.status === 404) {
+            await withRetry(() => octokit.rest.issues.createLabel({
+                owner,
+                repo,
+                name: label,
+                color: label === "gitybara:in-progress" ? "fbca04" : "0e8a16",
+            }));
+        } else {
+            throw err;
+        }
     }
-    await octokit.rest.issues.addLabels({
+    await withRetry(() => octokit.rest.issues.addLabels({
         owner,
         repo,
         issue_number: issueNumber,
         labels: [label],
-    });
+    }));
 }
 
 export async function commentOnIssue(
@@ -77,12 +83,12 @@ export async function commentOnIssue(
     issueNumber: number,
     body: string
 ): Promise<void> {
-    await octokit.rest.issues.createComment({
+    await withRetry(() => octokit.rest.issues.createComment({
         owner,
         repo,
         issue_number: issueNumber,
         body,
-    });
+    }));
 }
 
 export async function getIssueComments(
@@ -91,14 +97,14 @@ export async function getIssueComments(
     repo: string,
     issueNumber: number
 ): Promise<string[]> {
-    const { data } = await octokit.rest.issues.listComments({
+    const { data } = await withRetry(() => octokit.rest.issues.listComments({
         owner,
         repo,
         issue_number: issueNumber,
         per_page: 100, // Fetch up to 100 comments
-    });
+    }));
 
-    return data.map((comment) => comment.body || "");
+    return data.map((comment: any) => comment.body || "");
 }
 
 export async function ensureModelLabels(
@@ -115,12 +121,12 @@ export async function ensureModelLabels(
     try {
         let page = 1;
         while (true) {
-            const { data } = await octokit.rest.issues.listLabelsForRepo({
+            const { data } = await withRetry(() => octokit.rest.issues.listLabelsForRepo({
                 owner,
                 repo,
                 per_page: 100,
                 page,
-            });
+            }));
             if (data.length === 0) break;
             for (const label of data) {
                 existingLabels.add(label.name);
@@ -147,13 +153,13 @@ export async function ensureModelLabels(
     const promises = modelsToCreate.map(model => limit(async () => {
         const labelName = `model:${model.modelId}`;
         try {
-            await octokit.rest.issues.createLabel({
+            await withRetry(() => octokit.rest.issues.createLabel({
                 owner,
                 repo,
                 name: labelName,
                 color: "1d76db",
                 description: `Run Gitybara with ${model.providerId}/${model.modelId}`
-            });
+            }));
             log.debug({ label: labelName }, "Created missing label");
         } catch (err: any) {
             // Label likely already exists (422) or something went wrong
