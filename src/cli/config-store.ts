@@ -28,6 +28,16 @@ export interface RepoConfig {
     baseBranch: string;
     clonePath: string;
     webhookSecret?: string;
+    autoMerge?: AutoMergeSettings;
+}
+
+export interface AutoMergeSettings {
+    enabled: boolean;
+    autoMergeClean: boolean;
+    autoResolveConflicts: boolean;
+    mergeMethod: 'merge' | 'squash' | 'rebase';
+    requireChecks: boolean;
+    requireReviews: boolean;
 }
 
 export function ensureGitybaraDir(): void {
@@ -53,5 +63,16 @@ export function getDefaultConfig(): GlobalConfig {
         pollingIntervalMinutes: 5,
         daemonPort: 4242,
         opencodePath: "opencode",
+    };
+}
+
+export function getDefaultAutoMergeSettings(): AutoMergeSettings {
+    return {
+        enabled: true,
+        autoMergeClean: true,
+        autoResolveConflicts: true,
+        mergeMethod: 'merge',
+        requireChecks: false,
+        requireReviews: false,
     };
 }

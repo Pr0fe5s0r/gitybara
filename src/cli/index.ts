@@ -17,6 +17,7 @@ import { cancelCommand, listJobsCommand } from "./cancel.js";
 import { configCommand, configModelCommand } from "./config.js";
 import { learnCommand } from "./learn.js";
 import { addRepoCommand, removeRepoCommand } from "./repo-management.js";
+import { autoMergeCommand } from "./auto-merge.js";
 import chalk from "chalk";
 
 import { createRequire } from "module";
@@ -140,6 +141,18 @@ program
     .argument("[repo]", "Repository name (owner/repo)")
     .action(async (repo) => {
         await removeRepoCommand(repo);
+    });
+
+program
+    .command("auto-merge")
+    .description("Manage auto-merge for pull requests")
+    .argument("<action>", "Action: enable, disable, status, config")
+    .argument("[target]", "PR number or repo (owner/repo)")
+    .option("-r, --repo <repo>", "Repository (owner/repo)")
+    .option("-m, --method <method>", "Merge method: merge, squash, rebase", "merge")
+    .option("--disable", "Disable auto-merge (for config action)")
+    .action(async (action, target, options) => {
+        await autoMergeCommand(action, target, options);
     });
 
 program.parse(process.argv);
