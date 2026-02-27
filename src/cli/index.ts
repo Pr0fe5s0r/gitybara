@@ -6,6 +6,7 @@ import { stopCommand } from "./stop.js";
 import { statusCommand } from "./status.js";
 import { configCommand } from "./config.js";
 import { learnCommand } from "./learn.js";
+import { addRepoCommand, removeRepoCommand } from "./repo-management.js";
 import chalk from "chalk";
 
 const program = new Command();
@@ -59,5 +60,43 @@ program
     .option("--dont <rule>", "Add a DON'T rule")
     .option("--id <id>", "Rule ID to remove")
     .action(learnCommand);
+
+program
+    .command("repo")
+    .description("Manage connected repositories")
+    .argument("[action]", "add | rm | list", "list")
+    .argument("[repo]", "Repository name (owner/repo)")
+    .action(async (action, repo) => {
+        if (action === "add") {
+            await addRepoCommand(repo);
+        } else if (action === "rm" || action === "remove") {
+            await removeRepoCommand(repo);
+        } else {
+            const { readConfig } = await import("./config-store.js");
+            const config = readConfig();
+            if (!config || config.repos.length === 0) {
+                console.log(chalk.yellow("No repositories connected."));
+            } else {
+                console.log(chalk.bold("\nConnected Repositories:"));
+                config.repos.forEach(r => console.log(`- ${r.owner}/${r.repo} (${chalk.gray(r.clonePath)})`));
+            }
+        }
+    });
+
+program
+    .command("add")
+    .description("Add a repository (alias for 'repo add')")
+    .argument("[repo]", "Repository name (owner/repo)")
+    .action(async (repo) => {
+        await addRepoCommand(repo);
+    });
+
+program
+    .command("rm")
+    .description("Remove a repository (alias for 'repo rm')")
+    .argument("[repo]", "Repository name (owner/repo)")
+    .action(async (repo) => {
+        await removeRepoCommand(repo);
+    });
 
 program.parse(process.argv);

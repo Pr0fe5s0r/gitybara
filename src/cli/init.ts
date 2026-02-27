@@ -13,7 +13,13 @@ import {
 } from "./config-store.js";
 import { initDb } from "../db/index.js";
 import { createGitHubClient } from "../github/client.js";
+import { fetchUserRepos } from "../github/repos.js";
 import { execa } from "execa";
+import autocomplete from "inquirer-autocomplete-prompt";
+import fuzzy from "fuzzy";
+
+// Register autocomplete prompt
+inquirer.registerPrompt("autocomplete", autocomplete);
 
 export async function initCommand(options: { repo?: string }) {
     console.log(
@@ -52,21 +58,50 @@ export async function initCommand(options: { repo?: string }) {
     let initialRepo = options.repo;
     let addAnother = true;
 
+    const octokit = createGitHubClient(githubToken);
+    let allRepos: string[] = [];
+    const repoSpinner = ora("Fetching your repositories from GitHub...").start();
+    try {
+        allRepos = await fetchUserRepos(octokit);
+        repoSpinner.succeed(chalk.green(`Found ${allRepos.length} repositories`));
+    } catch (err) {
+        repoSpinner.warn(chalk.yellow("Could not fetch repositories from GitHub. You will need to enter them manually."));
+    }
+
     while (addAnother) {
         let repoInput = initialRepo;
         if (!repoInput) {
-            const ans = await inquirer.prompt([
-                {
-                    type: "input",
-                    name: "repo",
-                    message: "Repository (owner/repo):",
-                    validate: (v: string) =>
-                        /^[\w.-]+\/[\w.-]+$/.test(v) ? true : "Format: owner/repo",
-                },
-            ]);
-            repoInput = ans.repo as string;
+            if (allRepos.length > 0) {
+                const { repoSelection } = await inquirer.prompt([
+                    {
+                        type: "autocomplete",
+                        name: "repoSelection",
+                        message: "Select a repository:",
+                        source: (_answers: any, input: string) => {
+                            input = input || "";
+                            return fuzzy.filter(input, allRepos).map(el => el.original);
+                        },
+                    },
+                ]);
+                repoInput = repoSelection;
+            } else {
+                const ans = await inquirer.prompt([
+                    {
+                        type: "input",
+                        name: "repo",
+                        message: "Repository (owner/repo):",
+                        validate: (v: string) =>
+                            /^[\w.-]+\/[\w.-]+$/.test(v) ? true : "Format: owner/repo",
+                    },
+                ]);
+                repoInput = ans.repo as string;
+            }
         }
 
+        if (!repoInput) {
+            console.error(chalk.red("No repository selected. Operation cancelled."));
+            return;
+        }
         const [owner, repo] = repoInput.split("/");
 
         const { issueLabel, baseBranch } = await inquirer.prompt([
