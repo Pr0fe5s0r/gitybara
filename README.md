@@ -110,10 +110,13 @@ npm link
 ## 🚦 Getting Started
 
 ### 1️⃣ Initialize
+Launch the onboarding wizard to connect your GitHub account and select repositories using a searchable interface.
 
 ```bash
 gitybara init
 ```
+
+*Note: You can also use `gitybara add` later to connect more repositories individually.*
 
 ### 2️⃣ Start the Agent
 
@@ -165,13 +168,16 @@ GitHub becomes the control panel.
 
 ## 📊 CLI Commands
 
-| Command           | Description                 |
-| ----------------- | --------------------------- |
-| `gitybara init`   | Connect repositories        |
-| `gitybara start`  | Start background agent      |
-| `gitybara stop`   | Stop agent                  |
-| `gitybara status` | View active jobs            |
-| `gitybara config` | Configure tokens & settings |
+| Command           | Description                        |
+| ----------------- | ---------------------------------- |
+| `gitybara init`   | Connect repositories (Searchable)  |
+| `gitybara add`    | Add a new repository (Searchable)   |
+| `gitybara rm`     | Remove a repository                |
+| `gitybara start`  | Start background agent             |
+| `gitybara stop`   | Stop agent                         |
+| `gitybara status` | View active jobs                   |
+| `gitybara config` | Configure tokens & settings        |
+| `gitybara repo`   | List all connected repositories    |
 
 ---
 
