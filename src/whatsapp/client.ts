@@ -133,6 +133,11 @@ export async function startWhatsappDaemon(
     });
 
     client.on("message_create", async (msg) => {
+        // Ignore self-messages (messages sent to oneself)
+        if (msg.fromMe && msg.to === ownerId) {
+            return;
+        }
+
         // Normalize comparison for owner verification
         const isFromOwner = msg.from === ownerId;
         if (!isFromOwner) return;
