@@ -55,14 +55,12 @@ export async function runDaemon(config: GlobalConfig, port: number) {
         process.exit(0);
     });
 
+    // Initial poll immediately, then on interval
+    await pollAllRepos(config);
     const intervalMs = config.pollingIntervalMinutes * 60 * 1000;
-    const pollLoop = async () => {
-        while (true) {
-            await pollAllRepos(config).catch((e) => log.error({ e }, "Poll error"));
-            await new Promise(r => setTimeout(r, intervalMs));
-        }
-    };
-    pollLoop();
+    setInterval(() => {
+        pollAllRepos(config).catch((e) => log.error({ e }, "Poll error"));
+    }, intervalMs);
 
     // Periodic cleanup of abandoned runs every 10 minutes
     setInterval(() => {
@@ -189,20 +187,9 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 }
                 log.info({ issue: issue.number }, "User replied to clarification! Resuming work");
             }
-            if (existingJob.status === "failed") {
-                if (comments.length > 0 && comments[comments.length - 1].includes("🦫 **Gitybara** encountered an error:")) {
-                    log.debug({ issue: issue.number }, "Waiting for user to reply after failure, skipping");
-                    return;
-                }
-                log.info({ issue: issue.number }, "User replied after error! Retrying work");
-            }
         } else {
             log.info({ issue: issue.number, title: issue.title }, "New issue found — starting work");
         }
-
-        // Immediately mark as in-progress to prevent overlapping runs across loop ticks
-        const jobId = existingJob ? existingJob.id : await createJob(repoId, owner, repo, issue.number, issue.title);
-        await updateJob(jobId, "in-progress");
 
         const branchName = issueToBranchName(issue.number, issue.title);
         let finalBranchName = branchName;
@@ -242,7 +229,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             }
         }
 
-        // Job ID is defined and locked earlier above
+        const jobId = existingJob ? existingJob.id : await createJob(repoId, owner, repo, issue.number, issue.title);
 
         let selectedProvider = config.defaultProvider;
         let selectedModel = config.defaultModel;
@@ -261,8 +248,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
 
         // Robust safe name for directories across all OSes (no :, /, *, ?, ", <, >, |)
         const safeBranchName = finalBranchName.replace(/[^\w.-]/g, "-");
-        const uniqueId = Math.random().toString(36).substring(2, 10);
-        const workDir = path.join(path.dirname(clonePath), `${safeBranchName}-${uniqueId}`);
+        const workDir = path.join(path.dirname(clonePath), safeBranchName);
 
         try {
             // 1. Label issue as in-progress
