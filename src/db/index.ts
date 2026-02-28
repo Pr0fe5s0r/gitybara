@@ -132,7 +132,25 @@ export async function initDb(): Promise<void> {
         );`,
         `CREATE INDEX IF NOT EXISTS idx_conflict_history_repo ON conflict_resolution_history(repo_owner, repo_name);`,
         `CREATE INDEX IF NOT EXISTS idx_conflict_history_pr ON conflict_resolution_history(repo_owner, repo_name, pr_number);`,
-        `CREATE INDEX IF NOT EXISTS idx_conflict_history_status ON conflict_resolution_history(status);`
+        `CREATE INDEX IF NOT EXISTS idx_conflict_history_status ON conflict_resolution_history(status);`,
+        // Table for tracking future fix issues created from PR comments
+        `CREATE TABLE IF NOT EXISTS future_fix_issues (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_owner      TEXT NOT NULL,
+            repo_name       TEXT NOT NULL,
+            pr_number       INTEGER NOT NULL,
+            comment_id      INTEGER NOT NULL,
+            comment_body    TEXT NOT NULL,
+            issue_number    INTEGER,
+            issue_url       TEXT,
+            status          TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'created', 'failed')),
+            created_at      TEXT DEFAULT (datetime('now')),
+            updated_at      TEXT DEFAULT (datetime('now')),
+            UNIQUE(repo_owner, repo_name, comment_id)
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_future_fix_repo ON future_fix_issues(repo_owner, repo_name);`,
+        `CREATE INDEX IF NOT EXISTS idx_future_fix_pr ON future_fix_issues(repo_owner, repo_name, pr_number);`,
+        `CREATE INDEX IF NOT EXISTS idx_future_fix_status ON future_fix_issues(status);`
     ], "write");
 
     // Migration: Add force_new_branch to existing jobs table if missing
@@ -713,4 +731,97 @@ export async function getConflictResolutionStats(
     const successRate = total > 0 ? Math.round((success / total) * 100) : 0;
     
     return { total, success, failed, escalated, successRate };
+}
+
+// Future Fix Issues Types
+export interface FutureFixIssue {
+    id: number;
+    repo_owner: string;
+    repo_name: string;
+    pr_number: number;
+    comment_id: number;
+    comment_body: string;
+    issue_number: number | null;
+    issue_url: string | null;
+    status: 'pending' | 'created' | 'failed';
+    created_at: string;
+    updated_at: string;
+}
+
+// Track a future fix comment for issue creation
+export async function trackFutureFixComment(
+    repoOwner: string,
+    repoName: string,
+    prNumber: number,
+    commentId: number,
+    commentBody: string
+): Promise<number> {
+    const rs = await getDb().execute({
+        sql: `INSERT OR IGNORE INTO future_fix_issues 
+              (repo_owner, repo_name, pr_number, comment_id, comment_body, status)
+              VALUES (?, ?, ?, ?, ?, 'pending')`,
+        args: [repoOwner, repoName, prNumber, commentId, commentBody]
+    });
+    return Number(rs.lastInsertRowid);
+}
+
+// Update future fix issue with created issue details
+export async function updateFutureFixIssue(
+    repoOwner: string,
+    repoName: string,
+    commentId: number,
+    issueNumber: number,
+    issueUrl: string,
+    status: 'created' | 'failed'
+): Promise<void> {
+    await getDb().execute({
+        sql: `UPDATE future_fix_issues 
+              SET issue_number = ?, issue_url = ?, status = ?, updated_at = datetime('now')
+              WHERE repo_owner = ? AND repo_name = ? AND comment_id = ?`,
+        args: [issueNumber, issueUrl, status, repoOwner, repoName, commentId]
+    });
+}
+
+// Get pending future fix issues for a PR
+export async function getPendingFutureFixIssues(
+    repoOwner: string,
+    repoName: string,
+    prNumber: number
+): Promise<FutureFixIssue[]> {
+    const rs = await getDb().execute({
+        sql: `SELECT * FROM future_fix_issues 
+              WHERE repo_owner = ? AND repo_name = ? AND pr_number = ? AND status = 'pending'
+              ORDER BY created_at ASC`,
+        args: [repoOwner, repoName, prNumber]
+    });
+    return rs.rows as unknown as FutureFixIssue[];
+}
+
+// Get all future fix issues for a PR
+export async function getFutureFixIssuesForPR(
+    repoOwner: string,
+    repoName: string,
+    prNumber: number
+): Promise<FutureFixIssue[]> {
+    const rs = await getDb().execute({
+        sql: `SELECT * FROM future_fix_issues 
+              WHERE repo_owner = ? AND repo_name = ? AND pr_number = ?
+              ORDER BY created_at ASC`,
+        args: [repoOwner, repoName, prNumber]
+    });
+    return rs.rows as unknown as FutureFixIssue[];
+}
+
+// Check if a future fix comment is already tracked
+export async function isFutureFixTracked(
+    repoOwner: string,
+    repoName: string,
+    commentId: number
+): Promise<boolean> {
+    const rs = await getDb().execute({
+        sql: `SELECT id FROM future_fix_issues 
+              WHERE repo_owner = ? AND repo_name = ? AND comment_id = ?`,
+        args: [repoOwner, repoName, commentId]
+    });
+    return rs.rows.length > 0;
 }

@@ -32,7 +32,7 @@ import {
 } from "../db/index.js";
 import { createLogger } from "../utils/logger.js";
 import { registerTask, unregisterTask, cancelTask } from "../tasks/manager.js";
-import { findActionableComments, buildFixPrompt, postFixResponse, CommentMonitorConfig } from "../monitor/comments.js";
+import { findActionableComments, buildFixPrompt, postFixResponse, CommentMonitorConfig, createIssuesFromFutureFixes, postFutureFixSummary } from "../monitor/comments.js";
 
 const log = createLogger("daemon-loop");
 
@@ -938,7 +938,9 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                     'fix', 'change', 'update', 'modify', 'correct', 'improve',
                     'please fix', 'can you fix', 'need to fix', 'should fix',
                     'change request', 'requested changes', 'please address',
-                    'update the', 'modify the', 'fix the', 'correct the'
+                    'update the', 'modify the', 'fix the', 'correct the',
+                    'todo', 'fixme', 'future fix', 'later fix', 'address later',
+                    'temporary fix', 'hack', 'workaround'
                 ]
             };
 
@@ -947,80 +949,120 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             );
 
             if (actionableComments.length > 0) {
-                log.info({ pr: pr.number, comments: actionableComments.length },
-                    `💬 Found ${actionableComments.length} actionable comments on PR, applying fixes…`);
+                // Separate future fixes from immediate fixes
+                const futureFixComments = actionableComments.filter(ac => ac.actionType === 'future_fix');
+                const immediateFixComments = actionableComments.filter(ac => ac.actionType !== 'future_fix');
 
-                const branchName = fullPR.head.ref;
-                const safeBranchName = branchName.replace(/[^\w.-]/g, "-") + "-comment-fix";
-                const workDir = path.join(path.dirname(clonePath), safeBranchName);
-                const sharedGit = simpleGit(clonePath);
+                log.info({ 
+                    pr: pr.number, 
+                    total: actionableComments.length,
+                    immediate: immediateFixComments.length,
+                    future: futureFixComments.length
+                }, `💬 Found ${actionableComments.length} actionable comments (${immediateFixComments.length} immediate, ${futureFixComments.length} future fixes)`);
 
-                try {
-                    // Ensure workdir is clean
-                    if (fs.existsSync(workDir)) {
-                        await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
-                    }
+                // Handle future fix comments - create issues for them
+                if (futureFixComments.length > 0) {
+                    try {
+                        const futureFixResult = await createIssuesFromFutureFixes(
+                            octokit, owner, repo, pr.number, fullPR.title, futureFixComments
+                        );
 
-                    // Prepare worktree
-                    await sharedGit.fetch(["origin", branchName]);
-                    await execa("git", ["worktree", "add", "-d", workDir, `origin/${branchName}`], { cwd: clonePath });
-
-                    const git: SimpleGit = simpleGit(workDir);
-
-                    // Build prompt from actionable comments
-                    const fixPrompt = buildFixPrompt(
-                        fullPR.title,
-                        fullPR.body || '',
-                        actionableComments
-                    );
-
-                    log.info({ pr: pr.number }, "Running OpenCode to address feedback…");
-
-                    const result = await runOpenCode(
-                        config.opencodePath,
-                        workDir,
-                        fixPrompt,
-                        config.defaultProvider,
-                        config.defaultModel
-                    );
-
-                    if (!result.success) {
-                        throw new Error(`OpenCode failed to apply fixes: ${result.summary}`);
-                    }
-
-                    if (result.filesChanged.length === 0) {
-                        log.info({ pr: pr.number }, "No file changes were made by OpenCode");
-                    } else {
-                        // Commit and push
-                        await git.add(".");
-                        const status = await git.status();
-                        if (status.staged.length > 0) {
-                            await git.commit(`🦫 Gitybara: Addressed feedback from PR comments`);
-                            const remoteWithToken = `https://x-access-token:${config.githubToken}@github.com/${owner}/${repo}.git`;
-                            await git.push(["-f", remoteWithToken, `HEAD:${branchName}`]);
-
-                            await postFixResponse(
-                                octokit, owner, repo, pr.number, true,
-                                result.filesChanged,
-                                result.summary
+                        if (futureFixResult.createdIssues.length > 0) {
+                            await postFutureFixSummary(
+                                octokit, owner, repo, pr.number, 
+                                futureFixResult.createdIssues
                             );
-
-                            log.info({ pr: pr.number }, "✅ Successfully applied fixes from PR comments");
+                            log.info({ 
+                                pr: pr.number, 
+                                issues: futureFixResult.createdIssues.map(i => i.number) 
+                            }, `✅ Created ${futureFixResult.createdIssues.length} future fix issues`);
                         }
+
+                        if (futureFixResult.errors.length > 0) {
+                            log.warn({ 
+                                pr: pr.number, 
+                                errors: futureFixResult.errors 
+                            }, 'Some future fix issues failed to create');
+                        }
+                    } catch (futureFixErr) {
+                        log.error({ err: futureFixErr, pr: pr.number }, "Failed to create future fix issues");
                     }
+                }
 
-                    // Cleanup
-                    await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
-                } catch (err) {
-                    log.error({ err, pr: pr.number }, "❌ Failed to apply fixes from comments");
-                    await commentOnIssue(
-                        octokit, owner, repo, pr.number,
-                        `🦫 **Gitybara** failed to automatically apply fixes from the feedback:\n\`\`\`\n${err}\n\`\`\``
-                    ).catch(() => { });
+                // Handle immediate fix comments - apply code changes
+                if (immediateFixComments.length > 0) {
+                    const branchName = fullPR.head.ref;
+                    const safeBranchName = branchName.replace(/[^\w.-]/g, "-") + "-comment-fix";
+                    const workDir = path.join(path.dirname(clonePath), safeBranchName);
+                    const sharedGit = simpleGit(clonePath);
 
-                    // Cleanup on error
-                    if (fs.existsSync(workDir)) {
-                        await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
+                    try {
+                        // Ensure workdir is clean
+                        if (fs.existsSync(workDir)) {
+                            await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
+                        }
+
+                        // Prepare worktree
+                        await sharedGit.fetch(["origin", branchName]);
+                        await execa("git", ["worktree", "add", "-d", workDir, `origin/${branchName}`], { cwd: clonePath });
+
+                        const git: SimpleGit = simpleGit(workDir);
+
+                        // Build prompt from actionable comments with full context
+                        const fixPrompt = buildFixPrompt(
+                            fullPR.title,
+                            fullPR.body || '',
+                            immediateFixComments
+                        );
+
+                        log.info({ pr: pr.number }, "Running OpenCode to address feedback…");
+
+                        const result = await runOpenCode(
+                            config.opencodePath,
+                            workDir,
+                            fixPrompt,
+                            config.defaultProvider,
+                            config.defaultModel
+                        );
+
+                        if (!result.success) {
+                            throw new Error(`OpenCode failed to apply fixes: ${result.summary}`);
+                        }
+
+                        if (result.filesChanged.length === 0) {
+                            log.info({ pr: pr.number }, "No file changes were made by OpenCode");
+                        } else {
+                            // Commit and push
+                            await git.add(".");
+                            const status = await git.status();
+                            if (status.staged.length > 0) {
+                                await git.commit(`🦫 Gitybara: Addressed feedback from PR comments`);
+                                const remoteWithToken = `https://x-access-token:${config.githubToken}@github.com/${owner}/${repo}.git`;
+                                await git.push(["-f", remoteWithToken, `HEAD:${branchName}`]);
+
+                                await postFixResponse(
+                                    octokit, owner, repo, pr.number, true,
+                                    result.filesChanged,
+                                    result.summary
+                                );
+
+                                log.info({ pr: pr.number }, "✅ Successfully applied fixes from PR comments");
+                            }
+                        }
+
+                        // Cleanup
+                        await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath });
+                    } catch (err) {
+                        log.error({ err, pr: pr.number }, "❌ Failed to apply fixes from comments");
+                        await commentOnIssue(
+                            octokit, owner, repo, pr.number,
+                            `🦫 **Gitybara** failed to automatically apply fixes from the feedback:\n\`\`\`\n${err}\n\`\`\``
+                        ).catch(() => { });
+
+                        // Cleanup on error
+                        if (fs.existsSync(workDir)) {
+                            await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
+                        }
                     }
                 }
             }
