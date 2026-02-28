@@ -558,26 +558,44 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 }
             }
 
-            // 7. Open PR
-            const prBody = buildPRBody(issue.number, issue.title, finalSummary, result.filesChanged);
-            const pr = await openPR(
-                octokit, owner, repo, branchName, baseBranch,
-                `fix(#${issue.number}): ${issue.title}`, prBody
-            );
+            // 7. Open PR (only if not joining an existing branch)
+            if (!isJoiningBranch) {
+                const prBody = buildPRBody(issue.number, issue.title, finalSummary, result.filesChanged);
+                const pr = await openPR(
+                    octokit, owner, repo, branchName, baseBranch,
+                    `fix(#${issue.number}): ${issue.title}`, prBody
+                );
 
-            // 8. Comment on issue with PR link
-            await commentOnIssue(
-                octokit, owner, repo, issue.number,
-                `🦫 **Gitybara** finished!\n\nOpened PR: ${pr.url}\n\n**Files changed:** ${result.filesChanged.join(", ")}\n\n**Summary:**\n${finalSummary}`
-            );
-            await labelIssue(octokit, owner, repo, issue.number, "gitybara:done").catch(() => { });
+                // 8. Comment on issue with PR link
+                await commentOnIssue(
+                    octokit, owner, repo, issue.number,
+                    `🦫 **Gitybara** finished!\n\nOpened PR: ${pr.url}\n\n**Files changed:** ${result.filesChanged.join(", ")}\n\n**Summary:**\n${finalSummary}`
+                );
+                await labelIssue(octokit, owner, repo, issue.number, "gitybara:done").catch(() => { });
 
-            await updateJob(jobId, "done", branchName, pr.url);
+                await updateJob(jobId, "done", branchName, pr.url);
 
-            // No automatic cleanup per user request
-            log.info({ issue: issue.number, pr: pr.url, workDir: encodeWorkspacePath(workDir) }, "Issue resolved — PR opened, work directory preserved.");
+                // No automatic cleanup per user request
+                log.info({ issue: issue.number, pr: pr.url, workDir: encodeWorkspacePath(workDir) }, "Issue resolved — PR opened, work directory preserved.");
 
-            log.info({ issue: issue.number, pr: pr.url }, "✅ Issue resolved — PR opened");
+                log.info({ issue: issue.number, pr: pr.url }, "✅ Issue resolved — PR opened");
+            } else {
+                // We're joining an existing branch/PR, so just update the existing PR
+                const associatedPRNumber = (issue as any).associatedPRNumber;
+                const prUrl = associatedPRNumber ? `https://github.com/${owner}/${repo}/pull/${associatedPRNumber}` : undefined;
+
+                await commentOnIssue(
+                    octokit, owner, repo, issue.number,
+                    `🦫 **Gitybara** updated the existing PR with additional changes!\n\n${prUrl ? `PR: ${prUrl}\n\n` : ""}**Files changed:** ${result.filesChanged.join(", ")}\n\n**Summary:**\n${finalSummary}`
+                );
+                await labelIssue(octokit, owner, repo, issue.number, "gitybara:done").catch(() => { });
+
+                await updateJob(jobId, "done", finalBranchName, prUrl);
+
+                log.info({ issue: issue.number, pr: associatedPRNumber, workDir: encodeWorkspacePath(workDir) }, "Issue resolved — updated existing PR, work directory preserved.");
+
+                log.info({ issue: issue.number, pr: associatedPRNumber }, "✅ Issue resolved — updated existing PR");
+            }
         } catch (err) {
             const errMsg = String(err);
 
