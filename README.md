@@ -181,6 +181,89 @@ GitHub becomes the control panel.
 
 ---
 
+## 💬 PR Comment Automation
+
+Gitybara automatically detects and responds to actionable comments on Pull Requests. This enables continuous development based on code review feedback.
+
+### How It Works
+
+When you or reviewers leave comments on PRs, Gitybara:
+1. Monitors PR comments in real-time
+2. Detects actionable keywords and patterns
+3. Automatically implements the requested changes
+4. Pushes updates back to the PR branch
+5. Posts a response summarizing the changes
+
+### Trigger Keywords
+
+Gitybara recognizes the following keywords and phrases in PR comments:
+
+**Direct Action Keywords:**
+- `fix`, `change`, `update`, `modify`, `correct`, `improve`
+- `please fix`, `can you fix`, `need to fix`, `should fix`
+- `change request`, `requested changes`, `please address`
+- `update the`, `modify the`, `fix the`, `correct the`
+
+**Future Fix Indicators:**
+- `TODO`, `FIXME`, `future fix`, `future improvement`
+- `later fix`, `fix later`, `address later`
+- `fix in next iteration`, `needs work`, `needs fixing`
+- `should be fixed`, `must fix`, `temporary fix`
+- `temporary solution`, `hack`, `workaround`
+
+### Comment Best Practices
+
+**Effective Comments:**
+```markdown
+TODO: Add input validation for the email field
+
+FIXME: The error handling here should catch specific exceptions
+
+Please fix the indentation in this function
+
+Can you update the README to document this new feature?
+```
+
+**Comments with Code Suggestions:**
+```markdown
+Please change this to use async/await:
+
+```typescript
+const result = await fetchData();
+```
+
+Fix the typo in the variable name: `recieve` should be `receive`
+```
+
+**Nitpick Comments:**
+```markdown
+nit: Consider using a constant here instead of magic number
+
+nitpick: The function name could be more descriptive
+```
+
+### What Gitybara Ignores
+
+- Bot comments (from CI tools, etc.)
+- Gitybara's own comments (to avoid loops)
+- Comments without actionable keywords
+- Very short comments (< 50 characters without keywords)
+
+### Response Confidence
+
+Gitybara assigns a confidence score to each detected action:
+- **High (70%+):** Direct fix requests with code suggestions
+- **Medium (40-70%):** General fix/improvement requests
+- **Low (30-40%):** Questions or substantial feedback without clear action
+
+Only comments with confidence ≥ 30% are processed automatically.
+
+### Disabling Comment Processing
+
+To temporarily disable automatic comment processing on a PR, add the label `gitybara:pause` to the PR.
+
+---
+
 <div align="center">
   <sub>Autonomous development inside GitHub.</sub>
   <br>
