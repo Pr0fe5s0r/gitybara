@@ -14,7 +14,7 @@ import { commentOnIssue, labelIssue, ensureModelLabels, getIssueComments } from 
 import { runOpenCode, encodeWorkspacePath } from "../opencode/runner.js";
 import { getAvailableModels } from "../opencode/models.js";
 import { getRules, buildSystemPrompt } from "../learning/engine.js";
-import { ensureRepoMemory, updateRepoMemoryWithInsights } from "../memory/manager.js";
+import { ensureRepoMemory, updateRepoMemoryWithInsights, getRepoMemory, readExistingMemory } from "../memory/manager.js";
 import {
     upsertRepo,
     createJob,
@@ -180,6 +180,21 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
 
         // Ensure REPO_MEMORY.md exists for AI agent clarifications
         try {
+            // Check if memory already exists before generating
+            const existingDbMemory = await getRepoMemory(repoId);
+            const existingFileMemory = await readExistingMemory(clonePath);
+            
+            // If no memory exists, notify users that we're indexing the repository
+            if (!existingDbMemory && !existingFileMemory) {
+                log.info({ owner, repo }, "REPO_MEMORY.md not found, will generate. Notifying issues...");
+                for (const issue of issues) {
+                    await commentOnIssue(
+                        octokit, owner, repo, issue.number,
+                        `🦫 **Gitybara** is indexing this repository for the first time. This may take a few minutes while I analyze the codebase structure...`
+                    ).catch(() => { });
+                }
+            }
+            
             await ensureRepoMemory(
                 repoId,
                 clonePath,
