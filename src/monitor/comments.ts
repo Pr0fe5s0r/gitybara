@@ -29,7 +29,12 @@ const DEFAULT_KEYWORDS = [
     'fix', 'change', 'update', 'modify', 'correct', 'improve',
     'please fix', 'can you fix', 'need to fix', 'should fix',
     'change request', 'requested changes', 'please address',
-    'update the', 'modify the', 'fix the', 'correct the'
+    'update the', 'modify the', 'fix the', 'correct the',
+    // Future fix indicators
+    'todo', 'fixme', 'future fix', 'future improvement',
+    'later fix', 'fix later', 'address later', 'fix in next iteration',
+    'needs work', 'needs fixing', 'should be fixed', 'must fix',
+    'temporary fix', 'temporary solution', 'hack', 'workaround'
 ];
 
 /**
