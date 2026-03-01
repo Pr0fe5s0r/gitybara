@@ -18,6 +18,7 @@ import { configCommand, configModelCommand } from "./config.js";
 import { learnCommand } from "./learn.js";
 import { addRepoCommand, removeRepoCommand } from "./repo-management.js";
 import { autoMergeCommand } from "./auto-merge.js";
+import { connectCommand, disconnectCommand, listConnectionsCommand } from "./connections.js";
 import chalk from "chalk";
 
 import { createRequire } from "module";
@@ -153,6 +154,33 @@ program
     .option("--disable", "Disable auto-merge (for config action)")
     .action(async (action, target, options) => {
         await autoMergeCommand(action, target, options);
+    });
+
+program
+    .command("connect")
+    .description("Connect a chat service (WhatsApp or Telegram)")
+    .argument("<service>", "Service to connect: whatsapp, telegram")
+    .option("-f, --force", "Force new connection (reconnect)", false)
+    .action(async (service, options) => {
+        await connectCommand(service, options);
+    });
+
+program
+    .command("disconnect")
+    .description("Disconnect a chat service (WhatsApp or Telegram)")
+    .argument("<service>", "Service to disconnect: whatsapp, telegram")
+    .action(async (service) => {
+        await disconnectCommand(service);
+    });
+
+program
+    .command("connections")
+    .description("List configured chat connections")
+    .argument("[action]", "Action: list", "list")
+    .action(async (action) => {
+        if (action === "list" || !action) {
+            await listConnectionsCommand();
+        }
     });
 
 program.parse(process.argv);

@@ -1,8 +1,11 @@
-import { readConfig, PID_FILE } from "./config-store.js";
+import { readConfig, PID_FILE, GITYBARA_DIR } from "./config-store.js";
 import chalk from "chalk";
 import Table from "cli-table3";
 import fs from "fs";
+import path from "path";
 import { getDb } from "../db/index.js";
+
+const WHATSAPP_SESSION_PATH = path.join(GITYBARA_DIR, "sessions", "whatsapp");
 
 export async function statusCommand(options: { json?: boolean }) {
     const config = readConfig();
@@ -46,6 +49,12 @@ export async function statusCommand(options: { json?: boolean }) {
         console.log(`Port:    ${chalk.cyan(config.daemonPort)}`);
         console.log(`Poll:    every ${chalk.cyan(config.pollingIntervalMinutes)} minute(s)`);
         console.log(`Repos:   ${chalk.cyan(config.repos.length)} connected\n`);
+
+        // Connection status
+        const whatsappConnected = isWhatsAppConnected(config);
+        const telegramConnected = isTelegramConnected(config);
+        
+        console.log(`Chat:    ${whatsappConnected ? chalk.green("WhatsApp") : chalk.gray("WhatsApp")} | ${telegramConnected ? chalk.green("Telegram") : chalk.gray("Telegram")}\n`);
 
         if (config.repos.length > 0) {
             const repoTable = new Table({
@@ -127,4 +136,19 @@ export async function statusCommand(options: { json?: boolean }) {
     } catch { }
 
     console.log();
+}
+
+function isWhatsAppConnected(config: import("./config-store.js").GlobalConfig): boolean {
+    if (!config.whatsappOwnerId) return false;
+    if (!fs.existsSync(WHATSAPP_SESSION_PATH)) return false;
+    try {
+        const files = fs.readdirSync(WHATSAPP_SESSION_PATH);
+        return files.length > 0;
+    } catch {
+        return false;
+    }
+}
+
+function isTelegramConnected(config: import("./config-store.js").GlobalConfig): boolean {
+    return !!(config.telegramTokens && config.telegramTokens.length > 0 && config.telegramOwnerId);
 }
