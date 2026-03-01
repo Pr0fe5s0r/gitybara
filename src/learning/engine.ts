@@ -92,10 +92,11 @@ ${commentsSection}
 3. Make the necessary code changes to resolve the issue.
 4. Ensure all changes are consistent with the existing codebase style.
 5. Do not create new files unless absolutely necessary.
-6. After making changes, provide a concise summary of:
-   - What you changed and why
-   - Any important design decisions
-   - How to verify the fix
+6. NEVER create files with reserved names on Windows (e.g. nul, con, prn, aux, com1..9, lpt1..9).
+7. After making changes, provide a concise summary of:
+    - What you changed and why
+    - Any important design decisions
+    - How to verify the fix
 
 Begin working on the issue now.`.trim();
 }

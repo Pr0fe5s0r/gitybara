@@ -1,6 +1,6 @@
 {
   "name": "gitybara",
-  "version": "0.2.1",
+  "version": "0.2.4",
   "description": "An AI coding assistant that actually ships code automatically from GitHub issues.",
   "files": [
     "dist",
@@ -44,6 +44,7 @@
     "qrcode-terminal": "^0.12.0",
     "simple-git": "^3.22.0",
     "strip-ansi": "^6.0.1",
+    "undici": "^7.22.0",
     "uuid": "^13.0.0",
     "whatsapp-web.js": "^1.34.6",
     "wrap-ansi": "^9.0.0"

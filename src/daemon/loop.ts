@@ -39,6 +39,111 @@ const log = createLogger("daemon-loop");
 let cachedModels: { providerId: string, modelId: string }[] | null = null;
 const ensuredRepos = new Set<string>();
 
+// =============================================================================
+// SUPERVISOR / SELF-HEALING HELPER
+// =============================================================================
+
+const WINDOWS_RESERVED_NAMES = new Set([
+    "nul", "con", "prn", "aux",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"
+]);
+
+/**
+ * Recursively walk a directory and delete any file whose base name (no ext,
+ * case-insensitive) is a Windows-reserved device name (nul, con, prn, etc.).
+ * Uses \\?\ extended paths to bypass Windows restriction on these names.
+ */
+function removeReservedWindowsFiles(dir: string): void {
+    if (!fs.existsSync(dir)) return;
+    try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            const baseName = path.basename(entry.name, path.extname(entry.name)).toLowerCase();
+            if (WINDOWS_RESERVED_NAMES.has(baseName)) {
+                log.warn({ file: fullPath }, "🧹 Removing reserved Windows filename before git add");
+                try {
+                    rimrafSync(`\\\\?\\${fullPath}`);
+                } catch {
+                    try { rimrafSync(fullPath); } catch { /* ignore */ }
+                }
+            } else if (entry.isDirectory() && entry.name !== ".git") {
+                removeReservedWindowsFiles(fullPath);
+            }
+        }
+    } catch { /* ignore scan errors */ }
+}
+
+interface HealingOptions {
+    /** Directory where the healing OpenCode session runs */
+    healingDir: string;
+    /** Short human-readable context about the issue being worked on */
+    issueContext: string;
+    config: GlobalConfig;
+    selectedProvider?: string;
+    selectedModel?: string;
+    /** How many times to retry after a healing session. Default: 2 */
+    maxRetries?: number;
+}
+
+/**
+ * Supervisor wrapper: runs `fn`, and if it throws, starts an OpenCode
+ * healing session describing the error + context, then retries up to
+ * `maxRetries` times. Only rethrows once all retries are exhausted.
+ */
+async function runWithHealing<T>(
+    stageName: string,
+    fn: () => Promise<T>,
+    opts: HealingOptions
+): Promise<T> {
+    const maxRetries = opts.maxRetries ?? 2;
+    let lastErr: any;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (err: any) {
+            lastErr = err;
+            const errMsg = err?.message ?? String(err);
+
+            // Don't heal cancellations
+            if (errMsg.includes("cancelled")) throw err;
+
+            if (attempt >= maxRetries) break;
+
+            log.warn(
+                { stage: stageName, attempt: attempt + 1, maxRetries, err: errMsg },
+                `🩺 [supervisor] Stage "${stageName}" failed — starting healing session (attempt ${attempt + 1}/${maxRetries})`
+            );
+
+            const healPrompt =
+                `You are the Gitybara self-healing supervisor.\n` +
+                `A pipeline stage called "${stageName}" just failed with this error:\n\n` +
+                `${errMsg}\n\n` +
+                `Context — the issue being worked on:\n${opts.issueContext}\n\n` +
+                `Your job:\n` +
+                `1. Analyze the error carefully.\n` +
+                `2. Fix whatever caused it (e.g. illegal filenames, missing files, git state issues, dependency errors, wrong code, etc.).\n` +
+                `3. Do NOT re-run the original task. Only fix the environment/state so that the pipeline can continue.\n` +
+                `4. If no files need to change (e.g. a transient network error), just output a short explanation.`;
+
+            try {
+                await runOpenCode(
+                    opts.config.opencodePath,
+                    opts.healingDir,
+                    healPrompt,
+                    opts.selectedProvider,
+                    opts.selectedModel
+                );
+                log.info({ stage: stageName, attempt: attempt + 1 }, "🩺 [supervisor] Healing session completed, retrying stage");
+            } catch (healErr: any) {
+                log.error({ stage: stageName, err: healErr?.message ?? String(healErr) }, "🩺 [supervisor] Healing session itself failed, retrying stage anyway");
+            }
+        }
+    }
+    throw lastErr;
+}
+
 export async function runDaemon(config: GlobalConfig, port: number) {
     // Start HTTP server in background
     const { startServer } = await import("./server.js");
@@ -92,7 +197,7 @@ async function cleanupOldRuns(config: GlobalConfig) {
         const items = fs.readdirSync(reposDir);
         const now = Date.now();
         for (const item of items) {
-            if (item.startsWith("run-") || item.startsWith("gitybara-issue-")) {
+            if (item.startsWith("run-") || item.startsWith("gitybara-issue-") || item.startsWith("gb-i")) {
                 const fullPath = path.join(reposDir, item);
                 try {
                     const stat = fs.statSync(fullPath);
@@ -183,7 +288,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             // Check if memory already exists before generating
             const existingDbMemory = await getRepoMemory(repoId);
             const existingFileMemory = await readExistingMemory(clonePath);
-            
+
             // If no memory exists, notify users that we're indexing the repository
             if (!existingDbMemory && !existingFileMemory) {
                 log.info({ owner, repo }, "REPO_MEMORY.md not found, will generate. Notifying issues...");
@@ -194,7 +299,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                     ).catch(() => { });
                 }
             }
-            
+
             await ensureRepoMemory(
                 repoId,
                 clonePath,
@@ -380,9 +485,12 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             }
         }
 
-        // Robust safe name for directories across all OSes (no :, /, *, ?, ", <, >, |)
-        const safeBranchName = finalBranchName.replace(/[^\w.-]/g, "-");
-        const workDir = path.join(path.dirname(clonePath), safeBranchName);
+        // Shorten the directory name to avoid Windows MAX_PATH (260 char) issues.
+        // We use only the issue number and a very short slug for readability, keeping it under 25 chars.
+        const branchParts = finalBranchName.split('-');
+        const shortSlug = (branchParts.length > 2 ? branchParts.slice(-2) : branchParts).join('-').substring(0, 15);
+        const workDirName = `gb-i${issue.number}-${shortSlug}`.replace(/[^\w.-]/g, "-");
+        const workDir = path.join(path.dirname(clonePath), workDirName);
 
         // Update the registered task with workDir
         const { getRunningTask } = await import("../tasks/manager.js");
@@ -413,31 +521,44 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             log.info({ issue: issue.number, workDir: encodeWorkspacePath(workDir) }, "Preparing isolated workspace via git worktree…");
             const sharedGit = simpleGit(clonePath);
 
-            // Ensure old worktree from previous crash doesn't exist
-            if (fs.existsSync(workDir)) {
-                await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
-                await execa("git", ["worktree", "prune"], { cwd: clonePath }).catch(() => { });
-            }
+            // Always nuke any stale worktree — git worktree remove, prune, then rimraf
+            await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
+            await execa("git", ["worktree", "prune"], { cwd: clonePath }).catch(() => { });
+            rimrafSync(workDir);
+
+            const issueContext = `Issue #${issue.number}: ${issue.title}\n${issue.body || ""}`;
+            const healOpts: HealingOptions = {
+                healingDir: workDir,
+                issueContext,
+                config,
+                selectedProvider,
+                selectedModel,
+                maxRetries: 2
+            };
+            // clonePath-based healing opts for stages where workDir may not exist yet
+            const cloneHealOpts: HealingOptions = { ...healOpts, healingDir: clonePath };
 
             // 2. Checkout to final branch using detached HEAD for isolation
-            if (isJoiningBranch) {
-                log.info({ issue: issue.number, branch: finalBranchName }, "Joining existing branch via worktree…");
-                await sharedGit.fetch(["origin", finalBranchName]);
-                await execa("git", ["worktree", "add", "-d", workDir, `origin/${finalBranchName}`], { cwd: clonePath });
-            } else {
-                log.info({ issue: issue.number, branch: finalBranchName }, "Creating new branch via worktree…");
-                await createBranch(octokit, owner, repo, baseBranch, finalBranchName);
-                await sharedGit.fetch(["origin", finalBranchName]);
-                await execa("git", ["worktree", "add", "-d", workDir, `origin/${finalBranchName}`], { cwd: clonePath });
-            }
+            await runWithHealing("worktree-setup", async () => {
+                if (isJoiningBranch) {
+                    log.info({ issue: issue.number, branch: finalBranchName }, "Joining existing branch via worktree…");
+                    await sharedGit.fetch(["origin", finalBranchName]);
+                    await execa("git", ["worktree", "add", "-d", workDir, `origin/${finalBranchName}`], { cwd: clonePath });
+                } else {
+                    log.info({ issue: issue.number, branch: finalBranchName }, "Creating new branch via worktree…");
+                    await runWithHealing("branch-create", () => createBranch(octokit, owner, repo, baseBranch, finalBranchName), cloneHealOpts);
+                    await sharedGit.fetch(["origin", finalBranchName]);
+                    await execa("git", ["worktree", "add", "-d", workDir, `origin/${finalBranchName}`], { cwd: clonePath });
+                }
+            }, cloneHealOpts);
 
             const git: SimpleGit = simpleGit(workDir);
 
             // 4. Build prompt from learning rules
             const rules = await getRules(repoId);
-            const systemPrompt = buildSystemPrompt(
+            const systemPrompt = await buildSystemPrompt(
                 owner, repo, issue.number, issue.title,
-                issue.body || "", rules, comments
+                issue.body || "", rules, comments, repoId
             );
 
             // Check for cancellation before running OpenCode
@@ -445,14 +566,14 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 throw new Error("Task was cancelled by user");
             }
 
-            // 5. Run OpenCode
+            // 5. Run OpenCode (wrapped in supervisor)
             log.info({ issue: issue.number }, "Running OpenCode (this may take a few minutes)…");
 
             // Determine if we should share the session URL
             const shouldShareSession = issue.labels.includes("share:session_url");
             let sessionUrlPosted = false;
 
-            const result = await runOpenCode(
+            const result = await runWithHealing("opencode-run", () => runOpenCode(
                 config.opencodePath,
                 workDir,
                 systemPrompt,
@@ -471,7 +592,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                         log.info({ issue: issue.number }, "Skipping session URL comment (share:session_url label not found)");
                     }
                 }
-            );
+            ), { ...healOpts, maxRetries: 1 }); // 1 retry for OpenCode itself
 
             if (result.filesChanged.length === 0) {
                 // If the agent intentionally asked for clarification, pause it.
@@ -507,15 +628,23 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             const finalSummary = result.success ? result.summary :
                 (result.summary || "OpenCode made changes but the request timed out. These changes have been applied for your review.");
 
-            // 6. Commit and push
-            await git.add(".");
-            await git.commit(
-                `fix(#${issue.number}): ${issue.title}\n\nResolved by Gitybara 🦫\n\n${finalSummary}`
-            );
-
-            // Force push if necessary in case branch already existed (push from detached HEAD)
+            // 6. Commit and push — supervised
             const remoteWithToken = `https://x-access-token:${config.githubToken}@github.com/${owner}/${repo}.git`;
-            await git.push(["-f", remoteWithToken, `HEAD:${finalBranchName}`]);
+
+            await runWithHealing("git-commit-push", async () => {
+                // Filter reserved Windows filenames before staging
+                removeReservedWindowsFiles(workDir);
+
+                await git.add(".");
+                const staged = await git.status();
+                if (staged.staged.length > 0) {
+                    await git.commit(
+                        `fix(#${issue.number}): ${issue.title}\n\nResolved by Gitybara 🦫\n\n${finalSummary}`
+                    );
+                }
+                // Force push from detached HEAD
+                await git.push(["-f", remoteWithToken, `HEAD:${finalBranchName}`]);
+            }, healOpts);
 
             // Check if there are actionable comments to address (from PR review)
             const actionableComments = (issue as any).actionableComments;
@@ -540,12 +669,18 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 );
 
                 if (fixResult.success && fixResult.filesChanged.length > 0) {
-                    // Commit the fixes
-                    await git.add(".");
-                    await git.commit(
-                        `fix(#${issue.number}): Addressed feedback from PR comments\n\n${fixResult.summary}`
-                    );
-                    await git.push(["-f", remoteWithToken, `HEAD:${finalBranchName}`]);
+                    // Commit the fixes — supervised
+                    await runWithHealing("git-commit-push-feedback", async () => {
+                        removeReservedWindowsFiles(workDir);
+                        await git.add(".");
+                        const staged = await git.status();
+                        if (staged.staged.length > 0) {
+                            await git.commit(
+                                `fix(#${issue.number}): Addressed feedback from PR comments\n\n${fixResult.summary}`
+                            );
+                        }
+                        await git.push(["-f", remoteWithToken, `HEAD:${finalBranchName}`]);
+                    }, healOpts);
 
                     await postFixResponse(
                         octokit, owner, repo, associatedPRNumber, true,
@@ -558,13 +693,13 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 }
             }
 
-            // 7. Open PR (only if not joining an existing branch)
+            // 7. Open PR (only if not joining an existing branch) — supervised
             if (!isJoiningBranch) {
                 const prBody = buildPRBody(issue.number, issue.title, finalSummary, result.filesChanged);
-                const pr = await openPR(
+                const pr = await runWithHealing("pr-open", () => openPR(
                     octokit, owner, repo, branchName, baseBranch,
                     `fix(#${issue.number}): ${issue.title}`, prBody
-                );
+                ), healOpts);
 
                 // 8. Comment on issue with PR link
                 await commentOnIssue(
@@ -639,11 +774,11 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
         // Get auto-merge configuration
         const repoAutoMergeConfig = await getRepoAutoMergeConfig(repoId);
         const prAutoMergeConfig = await getPRAutoMergeConfig(owner, repo, pr.number);
-        
+
         // Determine effective configuration (PR config overrides repo config)
         const autoMergeEnabled = prAutoMergeConfig?.enabled ?? repoAutoMergeConfig?.enabled ?? true;
-        const autoMergeClean = prAutoMergeConfig?.enabled !== undefined 
-            ? prAutoMergeConfig.enabled 
+        const autoMergeClean = prAutoMergeConfig?.enabled !== undefined
+            ? prAutoMergeConfig.enabled
             : (repoAutoMergeConfig?.auto_merge_clean ?? true);
         const autoResolveConflicts = repoAutoMergeConfig?.auto_resolve_conflicts ?? true;
         const mergeMethod = (prAutoMergeConfig?.merge_method ?? repoAutoMergeConfig?.merge_method ?? 'merge') as 'merge' | 'squash' | 'rebase';
@@ -655,21 +790,21 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
         // Handle mergeable PRs with auto-merge
         if (isMergeable && autoMergeEnabled && autoMergeClean) {
             log.info({ pr: pr.number }, "📥 PR is mergeable, attempting auto-merge…");
-            
+
             const autoMergeResult = await enableAutoMerge(
-                octokit, owner, repo, pr.number, 
+                octokit, owner, repo, pr.number,
                 mergeMethod.toUpperCase() as 'MERGE' | 'SQUASH' | 'REBASE'
             );
-            
+
             if (autoMergeResult.success) {
                 log.info({ pr: pr.number }, `✅ Auto-merge enabled for PR: ${autoMergeResult.message}`);
                 await commentOnIssue(
-                    octokit, owner, repo, pr.number, 
+                    octokit, owner, repo, pr.number,
                     `🦫 **Gitybara** has enabled auto-merge for this PR using the **${mergeMethod}** method. The PR will be merged automatically when all checks pass.`
                 ).catch(() => { });
             } else {
                 log.warn({ pr: pr.number }, `⚠️ Could not enable auto-merge: ${autoMergeResult.message}`);
-                
+
                 // Try direct merge if auto-merge is not available
                 if (autoMergeResult.message.includes('not enabled for this repository')) {
                     const directMerge = await mergePullRequest(
@@ -677,7 +812,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                         `🦫 Auto-merge: ${fullPR.title}`,
                         `This PR was automatically merged by Gitybara when it became mergeable.`
                     );
-                    
+
                     if (directMerge.success) {
                         log.info({ pr: pr.number }, `✅ Directly merged PR: ${directMerge.message}`);
                         await commentOnIssue(
@@ -700,7 +835,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             const lastUpdated = new Date(fullPR.updated_at);
             const daysSinceUpdate = (Date.now() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
             const stalePrDays = repoAutoMergeConfig?.stale_pr_days ?? 7;
-            
+
             if (daysSinceUpdate < stalePrDays) {
                 log.info({ pr: pr.number, daysSinceUpdate, stalePrDays }, "PR is not stale yet, skipping conflict resolution.");
             } else {
@@ -710,7 +845,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             // Check max resolution attempts
             const maxAttempts = repoAutoMergeConfig?.max_resolution_attempts ?? 3;
             const failedAttempts = await getFailedResolutionAttemptCount(owner, repo, pr.number);
-            
+
             if (failedAttempts >= maxAttempts) {
                 log.warn({ pr: pr.number, failedAttempts, maxAttempts }, "Max resolution attempts reached, escalating to human review.");
                 await commentOnIssue(
@@ -747,7 +882,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 log.info({ pr: pr.number, base: fullPR.base.ref }, "Merging base branch into PR branch…");
                 let resolvedByAI = false;
                 let conflictedFiles: string[] = [];
-                
+
                 try {
                     await sharedGit.fetch(["origin", fullPR.base.ref]);
                     await execa("git", ["merge", `origin/${fullPR.base.ref}`], { cwd: workDir });
@@ -758,12 +893,12 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                     // Get list of conflicted files
                     const status = await git.status();
                     conflictedFiles = status.conflicted;
-                    
+
                     if (conflictedFiles.length === 0) {
                         log.info({ pr: pr.number }, "No conflicted files found after merge attempt.");
                     } else {
                         log.info({ pr: pr.number, files: conflictedFiles }, `Found ${conflictedFiles.length} conflicted files`);
-                        
+
                         // Create tracking record
                         attemptId = await createConflictResolutionAttempt(
                             owner, repo, pr.number, fullPR.title, conflictedFiles
@@ -772,7 +907,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                         // Categorize files based on patterns
                         const filesToResolve: string[] = [];
                         const filesToEscalate: string[] = [];
-                        
+
                         for (const file of conflictedFiles) {
                             const action = await getActionForFile(repoId, file);
                             if (action === 'escalate') {
@@ -788,7 +923,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                         if (filesToEscalate.length > 0) {
                             log.warn({ pr: pr.number, files: filesToEscalate }, `Escalating PR due to protected files: ${filesToEscalate.join(', ')}`);
                             escalatedFiles = filesToEscalate;
-                            
+
                             if (attemptId) {
                                 await updateConflictResolutionAttempt(
                                     attemptId,
@@ -799,12 +934,12 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                                     Date.now() - startTime
                                 );
                             }
-                            
+
                             await commentOnIssue(
                                 octokit, owner, repo, pr.number,
                                 `🦫 **Gitybara** detected conflicts in protected files that require manual review:\n\n${filesToEscalate.map(f => `- \`${f}\``).join('\n')}\n\nPlease resolve these conflicts manually.`
                             ).catch(() => { });
-                            
+
                             // Cleanup worktree
                             await execa("git", ["worktree", "remove", "--force", workDir], { cwd: clonePath }).catch(() => { });
                             return;
@@ -844,7 +979,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                         if (!result.success) {
                             throw new Error(`OpenCode failed to resolve conflicts: ${result.summary}`);
                         }
-                        
+
                         resolvedByAI = true;
                         resolvedFiles = filesToResolve;
                         log.info({ pr: pr.number, files: resolvedFiles }, "✅ OpenCode resolved conflicts.");
@@ -867,23 +1002,23 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 await git.add(".");
                 const status = await git.status();
                 if (status.staged.length > 0) {
-                    const commitMsg = resolvedByAI 
+                    const commitMsg = resolvedByAI
                         ? `🦫 Gitybara: Auto-resolved merge conflicts with ${fullPR.base.ref} using AI`
                         : `🦫 Gitybara: Auto-merged ${fullPR.base.ref} (no conflicts)`;
-                    
+
                     await git.commit(commitMsg);
                     const remoteWithToken = `https://x-access-token:${config.githubToken}@github.com/${owner}/${repo}.git`;
                     await git.push(["-f", remoteWithToken, `HEAD:${branchName}`]);
 
-                    const resolutionMessage = resolvedByAI 
+                    const resolutionMessage = resolvedByAI
                         ? `🦫 **Gitybara** has automatically detected and resolved merge conflicts in this PR!\n\nResolved files:\n${resolvedFiles.map(f => `- \`${f}\``).join('\n')}`
                         : `🦫 **Gitybara** has automatically updated this PR with the latest changes from ${fullPR.base.ref}.`;
-                    
+
                     await commentOnIssue(
-                        octokit, owner, repo, pr.number, 
+                        octokit, owner, repo, pr.number,
                         resolutionMessage
                     );
-                    
+
                     // Check if we should enable auto-merge after conflict resolution
                     if (autoMergeEnabled) {
                         log.info({ pr: pr.number }, "Attempting to enable auto-merge after conflict resolution…");
@@ -891,7 +1026,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                             octokit, owner, repo, pr.number,
                             mergeMethod.toUpperCase() as 'MERGE' | 'SQUASH' | 'REBASE'
                         );
-                        
+
                         if (autoMergeResult.success) {
                             log.info({ pr: pr.number }, `✅ Auto-merge enabled after conflict resolution`);
                             await commentOnIssue(
@@ -909,7 +1044,7 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
             } catch (err) {
                 const errorMsg = String(err);
                 log.error({ err, pr: pr.number }, "❌ Failed to resolve Conflicts");
-                
+
                 // Update tracking record with failure
                 if (attemptId) {
                     await updateConflictResolutionAttempt(
@@ -921,11 +1056,11 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                         Date.now() - startTime
                     );
                 }
-                
+
                 // Check if we've hit max attempts
                 const updatedFailedAttempts = await getFailedResolutionAttemptCount(owner, repo, pr.number);
                 const remainingAttempts = maxAttempts - updatedFailedAttempts;
-                
+
                 if (remainingAttempts <= 0) {
                     await commentOnIssue(
                         octokit, owner, repo, pr.number,
@@ -971,8 +1106,8 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
                 const futureFixComments = actionableComments.filter(ac => ac.actionType === 'future_fix');
                 const immediateFixComments = actionableComments.filter(ac => ac.actionType !== 'future_fix');
 
-                log.info({ 
-                    pr: pr.number, 
+                log.info({
+                    pr: pr.number,
                     total: actionableComments.length,
                     immediate: immediateFixComments.length,
                     future: futureFixComments.length
@@ -987,19 +1122,19 @@ async function processRepo(config: GlobalConfig, repoConfig: RepoConfig) {
 
                         if (futureFixResult.createdIssues.length > 0) {
                             await postFutureFixSummary(
-                                octokit, owner, repo, pr.number, 
+                                octokit, owner, repo, pr.number,
                                 futureFixResult.createdIssues
                             );
-                            log.info({ 
-                                pr: pr.number, 
-                                issues: futureFixResult.createdIssues.map(i => i.number) 
+                            log.info({
+                                pr: pr.number,
+                                issues: futureFixResult.createdIssues.map(i => i.number)
                             }, `✅ Created ${futureFixResult.createdIssues.length} future fix issues`);
                         }
 
                         if (futureFixResult.errors.length > 0) {
-                            log.warn({ 
-                                pr: pr.number, 
-                                errors: futureFixResult.errors 
+                            log.warn({
+                                pr: pr.number,
+                                errors: futureFixResult.errors
                             }, 'Some future fix issues failed to create');
                         }
                     } catch (futureFixErr) {
