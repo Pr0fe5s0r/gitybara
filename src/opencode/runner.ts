@@ -443,3 +443,74 @@ Reply with EXACTLY a JSON object:
 
     return { action: "CREATE_NEW", reason: "AI association failed, falling back to new branch." };
 }
+
+export async function generateFeedbackResponse(
+    context: { title: string; body: string; comments: any[] },
+    newComments: any[],
+    provider?: string,
+    model?: string
+): Promise<string> {
+    log.info({ model, provider }, "Generating personalized feedback response");
+
+    const systemPrompt = `You are Gitybara 🦫, an autonomous AI agent that solves GitHub issues.
+A user has provided feedback/comments on a Pull Request or Issue you are working on.
+
+Task Context:
+Title: ${context.title}
+Body: ${context.body}
+
+Previous Discussion:
+${context.comments.map(c => `- ${c.user.login}: ${c.body}`).join("\n")}
+
+New Feedback to address:
+${newComments.map(c => `- ${c.author}: ${c.body}`).join("\n")}
+
+Your Goal:
+Write a friendly, professional, and personalized response to the user.
+1. Acknowledge that you've read their specific points.
+2. Tell them you are starting to work on applying these fixes.
+3. Keep it brief but maintain the Gitybara 🦫 personality.
+4. Do NOT use markdown block quotes for the whole response.
+
+Response (raw text):`;
+
+    try {
+        const freePort = await getAvailablePort();
+        const opencode = await createOpencode({
+            port: freePort,
+            config: {
+                model: model && provider ? `${provider}/${model}` : model,
+            }
+        });
+
+        const { client } = opencode;
+        const sessionRes = await client.session.create({ body: { title: "Feedback Response Generator" } });
+        if (!sessionRes.data?.id) throw new Error("No session ID returned");
+
+        const response = await client.session.prompt({
+            path: { id: sessionRes.data.id },
+            body: { parts: [{ type: "text", text: systemPrompt }] }
+        });
+
+        let result = "[GITYBARA] 🦫 **Gitybara** is reviewing your feedback and applying fixes to this PR…";
+
+        if (response.data?.parts) {
+            result = response.data.parts
+                .filter((p: any) => p.type === "text")
+                .map((p: any) => p.text)
+                .join("\n")
+                .trim();
+
+            // Always prefix with [GITYBARA] tag for loop-prevention detection
+            if (!result.startsWith('[GITYBARA]')) {
+                result = `[GITYBARA] ${result}`;
+            }
+        }
+
+        await opencode.server.close();
+        return result;
+    } catch (err) {
+        log.error({ err }, "Error generating feedback response");
+        return "[GITYBARA] 🦫 **Gitybara** is reviewing your feedback and applying fixes to this PR…";
+    }
+}

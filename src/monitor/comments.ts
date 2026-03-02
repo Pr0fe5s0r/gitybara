@@ -32,6 +32,7 @@ export interface CommentMonitorConfig {
     requireLabel?: string;
     skipBotComments: boolean;
     actionableKeywords: string[];
+    requireMention?: boolean; // If true, only process if bot is mentioned
 }
 
 const DEFAULT_KEYWORDS = [
@@ -81,14 +82,14 @@ const PATTERN_WEIGHTS = {
  */
 function detectSemanticIntent(body: string): { type: string; confidence: number }[] {
     const intents: { type: string; confidence: number }[] = [];
-    
+
     for (const [patternName, pattern] of Object.entries(SEMANTIC_PATTERNS)) {
         if (pattern.test(body)) {
             const weight = PATTERN_WEIGHTS[patternName as keyof typeof PATTERN_WEIGHTS];
             intents.push({ type: patternName, confidence: weight });
         }
     }
-    
+
     return intents;
 }
 
@@ -105,7 +106,7 @@ function isFutureFixComment(body: string): boolean {
         /\bhack\b/i,
         /\bneeds?\s+(?:to\s+)?be\s+(?:fixed|addressed|improved)\s+(later|in\s+future)\b/i
     ];
-    
+
     return futurePatterns.some(pattern => pattern.test(body));
 }
 
@@ -114,40 +115,40 @@ function isFutureFixComment(body: string): boolean {
  */
 function isReplyToGitybara(body: string, previousComments: PRComment[]): boolean {
     if (previousComments.length === 0) return false;
-    
+
     const lastComment = previousComments[previousComments.length - 1];
-    return lastComment.body.includes('🦫 **Gitybara**') || 
-           body.toLowerCase().includes('@gitybara') ||
-           body.toLowerCase().includes('thanks gitybara') ||
-           body.toLowerCase().includes('thank you gitybara');
+    return lastComment.body.includes('🦫 **Gitybara**') ||
+        body.toLowerCase().includes('@gitybara') ||
+        body.toLowerCase().includes('thanks gitybara') ||
+        body.toLowerCase().includes('thank you gitybara');
 }
 
 /**
  * Calculate conversation context score based on previous interactions
  */
 function calculateContextScore(
-    comment: PRComment, 
+    comment: PRComment,
     previousComments: PRComment[]
 ): number {
     if (previousComments.length === 0) return 0;
-    
+
     let score = 0;
     const recentComments = previousComments.slice(-5); // Look at last 5 comments
-    
+
     // Check if this continues a previous discussion about fixes
-    const recentFixDiscussions = recentComments.filter(c => 
+    const recentFixDiscussions = recentComments.filter(c =>
         /\b(fix|change|update|modify|improve|address)\b/i.test(c.body)
     );
-    
+
     if (recentFixDiscussions.length > 0) {
         score += 0.2 * Math.min(recentFixDiscussions.length, 3);
     }
-    
+
     // Check if replying to a specific fix request
     if (isReplyToGitybara(comment.body, previousComments)) {
         score += 0.3;
     }
-    
+
     return Math.min(score, 0.5);
 }
 
@@ -173,8 +174,12 @@ export function analyzeComment(
         };
     }
 
-    // Skip Gitybara's own comments
-    if (comment.user.login === 'gitybara' || body.includes('🦫 **Gitybara**')) {
+    // Skip Gitybara's own comments (by username, emoji signature, or machine tag)
+    if (
+        comment.user.login === 'gitybara' ||
+        body.includes('[GITYBARA]') ||
+        body.includes('🦫 **Gitybara**')
+    ) {
         return {
             comment,
             actionType: 'ignore',
@@ -235,8 +240,8 @@ export function analyzeComment(
         actionType = 'fix';
     }
 
-    // Check for LGTM or approval (should be ignored)
-    if (/\b(lgtm|looks?\s+good\s+to\s+me|approved?|ship\s+it)\b/i.test(bodyLower)) {
+    // Check for LGTM or approval (should be ignored ONLY if no other action found)
+    if (actionType === 'ignore' && /\b(lgtm|looks?\s+good\s+to\s+me|approved?|ship\s+it)\b/i.test(bodyLower)) {
         return {
             comment,
             actionType: 'ignore',
@@ -286,18 +291,18 @@ function extractContextualRequest(body: string, context?: CommentContext): strin
     // First try to extract sentences containing action items
     const sentences = body.split(/[.!?]+/).filter(s => s.trim().length > 0);
     const actionSentences: string[] = [];
-    
+
     for (const sentence of sentences) {
         const sentenceLower = sentence.toLowerCase();
         if (/\b(fix|change|update|modify|improve|correct|address|todo|fixme)\b/i.test(sentenceLower)) {
             actionSentences.push(sentence.trim());
         }
     }
-    
+
     if (actionSentences.length > 0) {
         return actionSentences.join('. ');
     }
-    
+
     // If no specific action sentences found, return the whole body (truncated)
     return body.length > 500 ? body.substring(0, 500) + '...' : body;
 }
@@ -349,7 +354,7 @@ export async function getPRCommentHistory(
     // Get processed comment IDs from database
     const processedCommentIds = new Set<number>();
     const processedCommentsFromDb = await getProcessedCommentsForIssue(owner, repo, issueNumber);
-    
+
     for (const pc of processedCommentsFromDb) {
         processedCommentIds.add(pc.comment_id);
     }
@@ -368,18 +373,18 @@ export async function getPRCommentHistory(
 
     // Build conversation threads (group by approximate time proximity)
     const conversationThreads = new Map<number, PRComment[]>();
-    const sortedComments = [...allComments].sort((a, b) => 
+    const sortedComments = [...allComments].sort((a, b) =>
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
     );
 
     for (let i = 0; i < sortedComments.length; i++) {
         const comment = sortedComments[i];
         const thread: PRComment[] = [];
-        
+
         // Add comments from 2 hours before to current
         const commentTime = new Date(comment.created_at).getTime();
         const twoHoursMs = 2 * 60 * 60 * 1000;
-        
+
         for (let j = Math.max(0, i - 5); j <= i; j++) {
             const prevComment = sortedComments[j];
             const prevTime = new Date(prevComment.created_at).getTime();
@@ -387,7 +392,7 @@ export async function getPRCommentHistory(
                 thread.push(prevComment);
             }
         }
-        
+
         conversationThreads.set(comment.id, thread);
     }
 
@@ -430,26 +435,65 @@ export async function findActionableComments(
     }
 
     // Get full comment history with context
-    const { allComments, unprocessedComments, conversationThreads } = 
+    const { allComments, unprocessedComments, conversationThreads } =
         await getPRCommentHistory(octokit, owner, repo, issueNumber, isPR);
 
     const actionable: ActionableComment[] = [];
     const processedCommentIds: number[] = [];
 
+
+    // Build a set of timestamps where Gitybara already replied.  
+    // Any user comment posted BEFORE one of these timestamps is considered handled.
+    const gitybaraReplyTimestamps = allComments
+        .filter(c =>
+            c.body.includes('[GITYBARA]') ||
+            c.body.includes('🦫 **Gitybara**') ||
+            c.user.login === 'gitybara'
+        )
+        .map(c => new Date(c.created_at).getTime());
+
     for (const comment of unprocessedComments) {
+        // Skip Gitybara's own comments
+        if (
+            comment.body.includes('[GITYBARA]') ||
+            comment.body.includes('🦫 **Gitybara**') ||
+            comment.user.login === 'gitybara'
+        ) {
+            processedCommentIds.push(comment.id);
+            continue;
+        }
+
+        // Skip if Gitybara already replied AFTER this comment was posted
+        const commentTime = new Date(comment.created_at).getTime();
+        const alreadyReplied = gitybaraReplyTimestamps.some(t => t > commentTime);
+        if (alreadyReplied) {
+            processedCommentIds.push(comment.id);
+            log.debug({ commentId: comment.id }, 'Skipping comment — Gitybara already replied after it');
+            continue;
+        }
+
         // Build context for this comment
         const context: CommentContext = {
-            previousComments: allComments.filter(c => 
+            previousComments: allComments.filter(c =>
                 new Date(c.created_at) < new Date(comment.created_at)
             ),
             conversationThread: conversationThreads.get(comment.id) || [],
-            isReply: allComments.some(c => 
-                new Date(c.created_at) < new Date(comment.created_at) && 
+            isReply: allComments.some(c =>
+                new Date(c.created_at) < new Date(comment.created_at) &&
                 c.user.login !== comment.user.login
             )
         };
 
         const analysis = analyzeComment(comment, config, context);
+
+        // If requireMention is set, only proceed if this comment or a previous one in the thread mentions the bot
+        if (config.requireMention && analysis.actionType !== 'ignore') {
+            const mentionsBot = isReplyToGitybara(comment.body, allComments.filter(c => new Date(c.created_at) < new Date(comment.created_at)));
+            if (!mentionsBot) {
+                analysis.actionType = 'ignore';
+                analysis.confidence = 0;
+            }
+        }
 
         // Handle different action types
         if (analysis.actionType === 'future_fix') {
@@ -460,7 +504,7 @@ export async function findActionableComments(
         } else if (analysis.actionType !== 'ignore' && analysis.confidence >= 0.3) {
             // Check for potential duplicates before adding
             const isDuplicate = await checkForDuplicateComment(analysis, owner, repo, issueNumber);
-            
+
             if (!isDuplicate) {
                 actionable.push(analysis);
                 processedCommentIds.push(comment.id);
@@ -481,7 +525,7 @@ export async function findActionableComments(
         if (comment) {
             const analysis = actionable.find(a => a.comment.id === commentId);
             await markCommentProcessed(
-                owner, repo, issueNumber, commentId, comment.body, 
+                owner, repo, issueNumber, commentId, comment.body,
                 analysis?.actionType || 'ignored'
             );
         }
@@ -509,27 +553,27 @@ async function checkForDuplicateComment(
     issueNumber: number
 ): Promise<boolean> {
     const processedComments = await getProcessedCommentsForIssue(owner, repo, issueNumber);
-    
+
     const currentBody = analysis.comment.body.toLowerCase();
     const currentHash = await hashString(currentBody);
-    
+
     for (const processed of processedComments) {
         // Check exact hash match
         if (processed.comment_hash === currentHash) {
             return true;
         }
-        
+
         // Check for similar content (80% similarity threshold)
         const similarity = calculateSimilarity(
             processed.comment_body?.toLowerCase() || '',
             currentBody
         );
-        
+
         if (similarity > 0.8) {
             return true;
         }
     }
-    
+
     return false;
 }
 
@@ -539,15 +583,15 @@ async function checkForDuplicateComment(
 function calculateSimilarity(str1: string, str2: string): number {
     const words1 = new Set(str1.split(/\s+/).filter(w => w.length > 2));
     const words2 = new Set(str2.split(/\s+/).filter(w => w.length > 2));
-    
+
     if (words1.size === 0 && words2.size === 0) return 1;
     if (words1.size === 0 || words2.size === 0) return 0;
-    
+
     const words1Array = Array.from(words1);
     const words2Array = Array.from(words2);
     const intersection = new Set(words1Array.filter(x => words2.has(x)));
     const union = new Set([...words1Array, ...words2Array]);
-    
+
     return intersection.size / union.size;
 }
 
@@ -589,13 +633,13 @@ Body: ${originalIssueBody || 'No description provided'}
     for (let i = 0; i < actionableComments.length; i++) {
         const ac = actionableComments[i];
         const isFutureFix = ac.actionType === 'future_fix';
-        
+
         prompt += `${i + 1}. **${ac.actionType.toUpperCase()}** (confidence: ${Math.round(ac.confidence * 100)}%)`;
-        
+
         if (isFutureFix) {
             prompt += ` [FUTURE WORK - Create separate issue]`;
         }
-        
+
         prompt += `\n   From: @${ac.comment.user.login}\n`;
         prompt += `   Content: ${ac.comment.body}\n`;
 
@@ -627,17 +671,17 @@ Body: ${originalIssueBody || 'No description provided'}
     }
 
     prompt += `**Instructions:**\n`;
-    
+
     const hasFutureFixes = actionableComments.some(ac => ac.actionType === 'future_fix');
     const hasImmediateFixes = actionableComments.some(ac => ac.actionType === 'fix');
-    
+
     if (hasImmediateFixes) {
         prompt += `1. Address all immediate fix requests above (marked as FIX)\n`;
         prompt += `2. Make minimal, focused changes to fix the issues\n`;
         prompt += `3. Ensure all existing tests pass\n`;
         prompt += `4. If you cannot address a specific item, explain why in your summary\n`;
     }
-    
+
     if (hasFutureFixes) {
         if (hasImmediateFixes) {
             prompt += `5. For future fix indicators (marked as FUTURE_FIX), note them but don't implement yet\n`;
@@ -648,7 +692,7 @@ Body: ${originalIssueBody || 'No description provided'}
             prompt += `3. Do not make code changes for future fixes in this session\n`;
         }
     }
-    
+
     prompt += `\nPlease implement the necessary changes now.\n`;
 
     return prompt;
@@ -697,7 +741,7 @@ export async function postFixResponse(
     changesMade: string[],
     summary: string
 ): Promise<void> {
-    const body = `🦫 **Gitybara** has automatically addressed the feedback!
+    const body = `[GITYBARA] 🦫 **Gitybara** has automatically addressed the feedback!
 
 **Changes Made:**
 ${changesMade.map(c => `- ${c}`).join('\n')}
@@ -728,10 +772,10 @@ export async function createIssuesFromFutureFixes(
 ): Promise<{ success: boolean; createdIssues: Array<{ number: number; url: string }>; errors: string[] }> {
     const createdIssues: Array<{ number: number; url: string }> = [];
     const errors: string[] = [];
-    
-    log.info({ 
-        owner, repo, pr: prNumber, 
-        count: futureFixComments.length 
+
+    log.info({
+        owner, repo, pr: prNumber,
+        count: futureFixComments.length
     }, `Creating issues from ${futureFixComments.length} future fix comments`);
 
     for (const fixComment of futureFixComments) {
@@ -739,7 +783,7 @@ export async function createIssuesFromFutureFixes(
             // Check if already tracked
             const { isFutureFixTracked } = await import('../db/index.js');
             const alreadyTracked = await isFutureFixTracked(owner, repo, fixComment.comment.id);
-            
+
             if (alreadyTracked) {
                 log.debug({ commentId: fixComment.comment.id }, 'Future fix already tracked, skipping');
                 continue;
@@ -748,8 +792,8 @@ export async function createIssuesFromFutureFixes(
             // Track the future fix
             const { trackFutureFixComment } = await import('../db/index.js');
             await trackFutureFixComment(
-                owner, repo, prNumber, 
-                fixComment.comment.id, 
+                owner, repo, prNumber,
+                fixComment.comment.id,
                 fixComment.comment.body
             );
 
@@ -775,19 +819,19 @@ export async function createIssuesFromFutureFixes(
             );
 
             createdIssues.push({ number: issue.number, url: issue.html_url });
-            log.info({ 
-                issue: issue.number, 
-                commentId: fixComment.comment.id 
+            log.info({
+                issue: issue.number,
+                commentId: fixComment.comment.id
             }, 'Created issue from future fix comment');
 
         } catch (error: any) {
             const errorMsg = `Failed to create issue from comment ${fixComment.comment.id}: ${error.message}`;
             errors.push(errorMsg);
-            log.error({ 
-                err: error, 
-                commentId: fixComment.comment.id 
+            log.error({
+                err: error,
+                commentId: fixComment.comment.id
             }, errorMsg);
-            
+
             // Mark as failed in tracking
             try {
                 const { updateFutureFixIssue } = await import('../db/index.js');
@@ -815,26 +859,26 @@ export async function createIssuesFromFutureFixes(
  */
 function extractIssueTitle(fixComment: ActionableComment): string {
     const body = fixComment.comment.body;
-    
+
     // Try to extract first sentence or key phrase
     const firstSentence = body.split(/[.!?]/)[0].trim();
-    
+
     // Clean up common prefixes
     let title = firstSentence
         .replace(/^\s*(TODO|FIXME|HACK|XXX)[\s:]*/i, '')
         .replace(/^\s*[-*]\s*/, '')
         .trim();
-    
+
     // Limit length
     if (title.length > 80) {
         title = title.substring(0, 77) + '...';
     }
-    
+
     // Add prefix based on action type
     if (title.length > 0) {
         return `[Future Fix] ${title}`;
     }
-    
+
     return `[Future Fix] Address comment from PR review`;
 }
 
@@ -842,8 +886,8 @@ function extractIssueTitle(fixComment: ActionableComment): string {
  * Build issue body from future fix comment
  */
 function buildFutureFixIssueBody(
-    fixComment: ActionableComment, 
-    prNumber: number, 
+    fixComment: ActionableComment,
+    prNumber: number,
     prTitle: string
 ): string {
     let body = `## Future Fix from PR Review
@@ -888,7 +932,7 @@ export async function postFutureFixSummary(
 ): Promise<void> {
     if (createdIssues.length === 0) return;
 
-    const body = `🦫 **Gitybara** has created ${createdIssues.length} issue(s) for future fixes identified in this PR:
+    const body = `[GITYBARA] 🦫 **Gitybara** has created ${createdIssues.length} issue(s) for future fixes identified in this PR:
 
 ${createdIssues.map(issue => `- #${issue.number}: ${issue.url}`).join('\n')}
 
